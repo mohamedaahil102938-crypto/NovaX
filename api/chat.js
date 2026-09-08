@@ -1,12 +1,16 @@
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
-  const apiKey = process.env.GEMINI_API_KEY;
-  const model = 'gemini-2.5-flash';
+  // Cerebras only. Use a different current Cerebras model for NOVA.
+  const models = ['qwen-3-32b', 'gpt-oss-120b'];
 
-  if (!apiKey || !apiKey.trim()) {
+  const keys = [1, 2, 3, 4]
+    .map((n) => process.env[`CEREBRAS_API_KEY_${n}`])
+    .filter((key) => typeof key === 'string' && key.trim());
+
+  if (!keys.length) {
     return res.status(500).json({
-      error: 'Gemini is not configured. Add GEMINI_API_KEY to the Vercel Project Environment Variables, then redeploy.'
+      error: 'NOVA has no Cerebras keys available in this Vercel deployment.'
     });
   }
 
@@ -17,65 +21,69 @@ export default async function handler(req, res) {
 
   if (!messages.length) return res.status(400).json({ error: 'Messages are required.' });
 
-  const system = `You are NOVA — Your AI Workspace. Answer the user's actual question directly, accurately, and naturally. Help with school, science, math, technology, writing, coding, planning, brainstorming, and everyday questions. Current workspace: ${workspace}. The user stays centered while NOVA moves the workspace around them. Do not claim to have tools, web access, file generation, execution, or integrations that are not actually connected. ${context ? `User supplied context:\n${context}` : ''}`;
+  const system = {
+    role: 'system',
+    content: `You are NOVA — Your AI Workspace. Answer the user's actual question directly, clearly and helpfully. You can help with school, science, math, technology, coding, writing, planning, brainstorming and everyday questions. Current workspace: ${workspace}. The user stays centered while NOVA moves the workspace around them. Never pretend a tool or integration exists when it is not connected. ${context ? `User supplied file context:\n${context}` : ''}`
+  };
 
-  const contents = messages.slice(-30).map((m) => ({
-    role: m?.role === 'assistant' ? 'model' : 'user',
-    parts: [{ text: String(m?.content ?? '') }]
-  })).filter((m) => m.parts[0].text.trim());
+  const failures = [];
 
-  if (!contents.length) return res.status(400).json({ error: 'No usable message content was provided.' });
+  // Try the preferred Cerebras model first on each key, then fall back to another
+  // Cerebras model. If a key is rate-limited, immediately continue to the next key.
+  for (let k = 0; k < keys.length; k++) {
+    const apiKey = keys[k].trim();
 
-  try {
-    const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey.trim())}`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          systemInstruction: { parts: [{ text: system }] },
-          contents,
-          generationConfig: {
+    for (const model of models) {
+      try {
+        const response = await fetch('https://api.cerebras.ai/v1/chat/completions', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${apiKey}`
+          },
+          body: JSON.stringify({
+            model,
+            messages: [system, ...messages.slice(-30)],
             temperature: 0.7,
-            maxOutputTokens: 2048
+            max_tokens: 1200
+          })
+        });
+
+        const raw = await response.text();
+        let data = {};
+        try { data = raw ? JSON.parse(raw) : {}; } catch {}
+
+        if (response.ok) {
+          const answer = data?.choices?.[0]?.message?.content;
+          if (answer && String(answer).trim()) {
+            return res.status(200).json({
+              message: answer,
+              model,
+              provider: 'Cerebras',
+              keySlot: k + 1
+            });
           }
-        })
+          failures.push(`Key ${k + 1} / ${model}: empty response`);
+          continue;
+        }
+
+        const detail = data?.error?.message || data?.message || raw || `HTTP ${response.status}`;
+        failures.push(`Key ${k + 1} / ${model}: HTTP ${response.status} — ${detail}`);
+
+        // If the model itself is unavailable, try the next Cerebras model.
+        // For rate/usage limits, skip directly to the next key.
+        if (response.status === 401 || response.status === 403) break;
+        if (response.status === 429) break;
+      } catch (error) {
+        failures.push(`Key ${k + 1} / ${model}: ${error?.message || 'network error'}`);
       }
-    );
-
-    const raw = await response.text();
-    let data = {};
-    try { data = raw ? JSON.parse(raw) : {}; } catch {}
-
-    if (!response.ok) {
-      const detail = data?.error?.message || data?.message || raw || `HTTP ${response.status}`;
-      return res.status(502).json({
-        error: `Gemini returned HTTP ${response.status}: ${detail}`,
-        provider: 'Gemini',
-        model
-      });
     }
-
-    const answer = data?.candidates?.[0]?.content?.parts
-      ?.map((part) => part?.text || '')
-      .join('')
-      .trim();
-
-    if (!answer) {
-      const reason = data?.promptFeedback?.blockReason || data?.candidates?.[0]?.finishReason || 'No text was returned';
-      return res.status(502).json({
-        error: `Gemini returned no text (${reason}).`,
-        provider: 'Gemini',
-        model
-      });
-    }
-
-    return res.status(200).json({ message: answer, model, provider: 'Gemini' });
-  } catch (error) {
-    return res.status(502).json({
-      error: `Could not reach Gemini: ${error?.message || 'network error'}`,
-      provider: 'Gemini',
-      model
-    });
   }
+
+  return res.status(502).json({
+    error: 'NOVA could not get a response from the Cerebras API.',
+    details: failures,
+    configuredKeys: keys.length,
+    modelsTried: models
+  });
 }
