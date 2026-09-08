@@ -3,18 +3,14 @@ export default async function handler(req, res) {
     return res.status(405).json({ error: 'Method not allowed' });
   }
 
-  // Cerebras only. Try Llama 4 Scout first, then existing fallbacks.
-  const models = ['llama-4-scout-17b-16e-instruct', 'gemma-4-31b', 'llama3.1-8b', 'qwen-3-32b', 'gpt-oss-120b'];
+  // TEST MODE: Groq only. Cerebras code/env vars are intentionally left alone for now.
+  const apiKey = process.env.GROQ_API_KEY_1;
+  const model = 'openai/gpt-oss-120b';
 
-  const keys = [1, 2, 3, 4]
-    .map((n) => process.env[`CEREBRAS_API_KEY_${n}`])
-    .filter((key) => typeof key === 'string' && key.trim().length > 0)
-    .map((key) => key.trim());
-
-  if (!keys.length) {
+  if (!apiKey || !apiKey.trim()) {
     return res.status(500).json({
-      error: 'No Cerebras API keys are configured in this Vercel deployment.',
-      hint: 'Add CEREBRAS_API_KEY_1 through CEREBRAS_API_KEY_4 in Vercel Project Settings → Environment Variables, then redeploy.'
+      error: 'No Groq API key is configured.',
+      hint: 'Add GROQ_API_KEY_1 in Vercel Project Settings → Environment Variables, then redeploy.'
     });
   }
 
@@ -40,62 +36,61 @@ export default async function handler(req, res) {
     content: `You are NOVA — Your AI Workspace. Answer the user's actual question directly, clearly and helpfully. You can help with school, science, math, technology, coding, writing, planning, brainstorming and everyday questions. Current workspace: ${workspace}. The user stays centered while NOVA moves the workspace around them. Never pretend a tool or integration exists when it is not connected. ${context ? `User supplied file context:\n${context}` : ''}`
   };
 
-  const failures = [];
+  try {
+    const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey.trim()}`
+      },
+      body: JSON.stringify({
+        model,
+        messages: [system, ...messages.slice(-30)],
+        temperature: 1,
+        max_completion_tokens: 2048,
+        top_p: 1,
+        reasoning_effort: 'medium',
+        stream: false
+      })
+    });
 
-  for (let k = 0; k < keys.length; k++) {
-    const apiKey = keys[k];
+    const raw = await response.text();
+    let data = {};
+    try {
+      data = raw ? JSON.parse(raw) : {};
+    } catch {}
 
-    for (const model of models) {
-      try {
-        const response = await fetch('https://api.cerebras.ai/v1/chat/completions', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${apiKey}`
-          },
-          body: JSON.stringify({
-            model,
-            messages: [system, ...messages.slice(-30)],
-            temperature: 0.7,
-            max_completion_tokens: 1200
-          })
-        });
-
-        const raw = await response.text();
-        let data = {};
-        try {
-          data = raw ? JSON.parse(raw) : {};
-        } catch {}
-
-        if (response.ok) {
-          const answer = data?.choices?.[0]?.message?.content;
-          if (answer && String(answer).trim()) {
-            return res.status(200).json({
-              message: String(answer),
-              model,
-              provider: 'Cerebras',
-              keySlot: k + 1
-            });
-          }
-          failures.push(`Key ${k + 1} / ${model}: HTTP ${response.status} but Cerebras returned no message content.`);
-          continue;
-        }
-
-        const detail = data?.error?.message || data?.message || raw || `HTTP ${response.status}`;
-        failures.push(`Key ${k + 1} / ${model}: HTTP ${response.status} — ${detail}`);
-
-        if (response.status === 401 || response.status === 403) break;
-        if (response.status === 429) break;
-      } catch (error) {
-        failures.push(`Key ${k + 1} / ${model}: ${error?.message || 'network error'}`);
-      }
+    if (!response.ok) {
+      const detail = data?.error?.message || data?.message || raw || `HTTP ${response.status}`;
+      return res.status(502).json({
+        error: 'NOVA could not get a response from Groq.',
+        details: `Groq HTTP ${response.status} — ${detail}`,
+        provider: 'Groq',
+        model
+      });
     }
-  }
 
-  return res.status(502).json({
-    error: 'NOVA could not get a response from the Cerebras API.',
-    details: failures,
-    configuredKeys: keys.length,
-    modelsTried: models
-  });
+    const answer = data?.choices?.[0]?.message?.content;
+    if (!answer || !String(answer).trim()) {
+      return res.status(502).json({
+        error: 'Groq returned no message content.',
+        provider: 'Groq',
+        model
+      });
+    }
+
+    return res.status(200).json({
+      message: String(answer),
+      model,
+      provider: 'Groq',
+      keySlot: 1
+    });
+  } catch (error) {
+    return res.status(502).json({
+      error: 'NOVA could not reach Groq.',
+      details: error?.message || 'Network error',
+      provider: 'Groq',
+      model
+    });
+  }
 }
