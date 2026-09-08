@@ -3,8 +3,8 @@ export default async function handler(req, res) {
     return res.status(405).json({ error: 'Method not allowed' });
   }
 
-  // Cerebras only. Try Gemma 4 31B first, then existing fallbacks.
-  const models = ['gemma-4-31b', 'llama3.1-8b', 'qwen-3-32b', 'gpt-oss-120b'];
+  // Cerebras only. Try Llama 4 Scout first, then existing fallbacks.
+  const models = ['llama-4-scout-17b-16e-instruct', 'gemma-4-31b', 'llama3.1-8b', 'qwen-3-32b', 'gpt-oss-120b'];
 
   const keys = [1, 2, 3, 4]
     .map((n) => process.env[`CEREBRAS_API_KEY_${n}`])
