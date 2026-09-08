@@ -3,8 +3,8 @@ export default async function handler(req, res) {
     return res.status(405).json({ error: 'Method not allowed' });
   }
 
-  // Keep this Cerebras-only. Use a known lightweight model first, then fallbacks.
-  const models = ['llama3.1-8b', 'qwen-3-32b', 'gpt-oss-120b'];
+  // Cerebras only. Try Gemma 4 31B first, then existing fallbacks.
+  const models = ['gemma-4-31b', 'llama3.1-8b', 'qwen-3-32b', 'gpt-oss-120b'];
 
   const keys = [1, 2, 3, 4]
     .map((n) => process.env[`CEREBRAS_API_KEY_${n}`])
@@ -42,8 +42,6 @@ export default async function handler(req, res) {
 
   const failures = [];
 
-  // Rotate keys on rate/usage limits. A key that is exhausted is skipped
-  // immediately and the next configured Cerebras key gets the request.
   for (let k = 0; k < keys.length; k++) {
     const apiKey = keys[k];
 
@@ -79,7 +77,6 @@ export default async function handler(req, res) {
               keySlot: k + 1
             });
           }
-
           failures.push(`Key ${k + 1} / ${model}: HTTP ${response.status} but Cerebras returned no message content.`);
           continue;
         }
@@ -87,10 +84,7 @@ export default async function handler(req, res) {
         const detail = data?.error?.message || data?.message || raw || `HTTP ${response.status}`;
         failures.push(`Key ${k + 1} / ${model}: HTTP ${response.status} — ${detail}`);
 
-        // Bad credentials: skip the rest of this key.
         if (response.status === 401 || response.status === 403) break;
-
-        // Rate/usage limit: immediately move to the next key.
         if (response.status === 429) break;
       } catch (error) {
         failures.push(`Key ${k + 1} / ${model}: ${error?.message || 'network error'}`);
