@@ -3,8 +3,8 @@ export default async function handler(req, res) {
     return res.status(405).json({ error: 'Method not allowed' });
   }
 
-  // Cerebras models. The first model is preferred; the second is a fallback.
-  const models = ['qwen-3-32b', 'gpt-oss-120b'];
+  // Keep this Cerebras-only. Use a known lightweight model first, then fallbacks.
+  const models = ['llama3.1-8b', 'qwen-3-32b', 'gpt-oss-120b'];
 
   const keys = [1, 2, 3, 4]
     .map((n) => process.env[`CEREBRAS_API_KEY_${n}`])
@@ -14,14 +14,15 @@ export default async function handler(req, res) {
   if (!keys.length) {
     return res.status(500).json({
       error: 'No Cerebras API keys are configured in this Vercel deployment.',
-      hint: 'Add CEREBRAS_API_KEY_1 (and optionally _2, _3, _4) in Vercel Project Settings → Environment Variables, then redeploy.'
+      hint: 'Add CEREBRAS_API_KEY_1 through CEREBRAS_API_KEY_4 in Vercel Project Settings → Environment Variables, then redeploy.'
     });
   }
 
   let body = req.body || {};
-  // Vercel normally parses JSON, but safely handle a string body too.
   if (typeof body === 'string') {
-    try { body = JSON.parse(body); } catch {
+    try {
+      body = JSON.parse(body);
+    } catch {
       return res.status(400).json({ error: 'Invalid JSON request body.' });
     }
   }
@@ -41,8 +42,8 @@ export default async function handler(req, res) {
 
   const failures = [];
 
-  // Try every configured key. A rate limit or usage-limit response moves
-  // immediately to the next key. Authentication errors skip the bad key.
+  // Rotate keys on rate/usage limits. A key that is exhausted is skipped
+  // immediately and the next configured Cerebras key gets the request.
   for (let k = 0; k < keys.length; k++) {
     const apiKey = keys[k];
 
@@ -58,7 +59,7 @@ export default async function handler(req, res) {
             model,
             messages: [system, ...messages.slice(-30)],
             temperature: 0.7,
-            max_tokens: 1200
+            max_completion_tokens: 1200
           })
         });
 
@@ -66,9 +67,7 @@ export default async function handler(req, res) {
         let data = {};
         try {
           data = raw ? JSON.parse(raw) : {};
-        } catch {
-          // Keep the raw response for diagnostics below.
-        }
+        } catch {}
 
         if (response.ok) {
           const answer = data?.choices?.[0]?.message?.content;
@@ -81,18 +80,17 @@ export default async function handler(req, res) {
             });
           }
 
-          failures.push(`Key ${k + 1} / ${model}: Cerebras returned HTTP ${response.status} but no message content.`);
+          failures.push(`Key ${k + 1} / ${model}: HTTP ${response.status} but Cerebras returned no message content.`);
           continue;
         }
 
         const detail = data?.error?.message || data?.message || raw || `HTTP ${response.status}`;
         failures.push(`Key ${k + 1} / ${model}: HTTP ${response.status} — ${detail}`);
 
-        // Authentication/permission errors mean this key is unusable, so
-        // don't waste another model request on it.
+        // Bad credentials: skip the rest of this key.
         if (response.status === 401 || response.status === 403) break;
 
-        // 429 normally means rate/usage limiting. Move directly to the next key.
+        // Rate/usage limit: immediately move to the next key.
         if (response.status === 429) break;
       } catch (error) {
         failures.push(`Key ${k + 1} / ${model}: ${error?.message || 'network error'}`);
