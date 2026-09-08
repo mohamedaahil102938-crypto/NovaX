@@ -1,9 +1,9 @@
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
-  // NOVA V2 uses Cerebras' free Llama 3.1 8B model by default.
-  // Keep the model fixed here so an incorrect Vercel model variable cannot break NOVA.
-  const model = 'llama3.1-8b';
+  // Current Cerebras hosted model used by NOVA.
+  // llama3.1-8b was retired; use gpt-oss-120b instead.
+  const model = 'gpt-oss-120b';
 
   const keys = [1, 2, 3, 4]
     .map((n) => process.env[`CEREBRAS_API_KEY_${n}`])
@@ -11,7 +11,7 @@ export default async function handler(req, res) {
 
   if (!keys.length) {
     return res.status(500).json({
-      error: 'No Cerebras API keys are configured. Add CEREBRAS_API_KEY_1 through CEREBRAS_API_KEY_4 in Vercel Environment Variables.'
+      error: 'No Cerebras API keys are configured for this deployment.'
     });
   }
 
@@ -46,7 +46,7 @@ Workspace capabilities:
 - Mail: draft and organize emails. Never claim an email was sent without a real sending integration and user approval.
 - Settings: explain workspace settings and behavior.
 
-Answer the actual question first. Do not respond with vague instructions to 'check the model' when the request can be answered. If something is genuinely unavailable, clearly explain what is missing.
+Answer the actual question first. Do not tell the user to check environment variables or models unless the server itself reports a configuration problem. If something is unavailable, clearly explain what is missing.
 
 Be accurate, helpful, conversational, and reasonably concise. Use markdown when useful. Do not invent actions, files, searches, integrations, or results.
 
@@ -55,14 +55,13 @@ ${context ? `The user also supplied this workspace context/file text:\n${context
 
   let lastError = 'Cerebras request failed.';
 
-  // Try each configured key. If one hits a limit or temporary error, NOVA moves to the next key.
   for (const apiKey of keys) {
     try {
       const response = await fetch('https://api.cerebras.ai/v1/chat/completions', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          Authorization: `Bearer ${apiKey}`
+          Authorization: `Bearer ${apiKey.trim()}`
         },
         body: JSON.stringify({
           model,
@@ -75,11 +74,16 @@ ${context ? `The user also supplied this workspace context/file text:\n${context
       const data = await response.json().catch(() => ({}));
 
       if (response.ok) {
-        return res.status(200).json({
-          message: data.choices?.[0]?.message?.content || 'I did not receive a response.',
-          model,
-          provider: 'Cerebras'
-        });
+        const answer = data.choices?.[0]?.message?.content;
+        if (answer) {
+          return res.status(200).json({
+            message: answer,
+            model,
+            provider: 'Cerebras'
+          });
+        }
+        lastError = 'Cerebras returned an empty answer.';
+        continue;
       }
 
       lastError = data?.error?.message || `Cerebras returned HTTP ${response.status}.`;
@@ -89,7 +93,7 @@ ${context ? `The user also supplied this workspace context/file text:\n${context
   }
 
   return res.status(502).json({
-    error: `NOVA could not get an answer from Cerebras after trying the configured keys. ${lastError}`,
+    error: `Cerebras could not answer after trying the configured keys: ${lastError}`,
     model
   });
 }
