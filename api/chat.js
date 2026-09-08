@@ -3,15 +3,19 @@ export default async function handler(req, res) {
     return res.status(405).json({ error: 'Method not allowed' });
   }
 
-  // TEST MODE: Groq only, using exactly one key.
-  // Cerebras environment variables/code are intentionally untouched.
-  const apiKey = process.env.GROQ_API_KEY_1?.trim();
+  // Groq only. The frontend/UI is intentionally untouched.
+  const apiKeys = [
+    process.env.GROQ_API_KEY_1?.trim(),
+    process.env.GROQ_API_KEY_2?.trim(),
+    process.env.GROQ_API_KEY_3?.trim()
+  ].filter(Boolean);
+
   const model = 'openai/gpt-oss-120b';
 
-  if (!apiKey) {
+  if (!apiKeys.length) {
     return res.status(500).json({
-      error: 'No Groq API key is configured.',
-      hint: 'Add GROQ_API_KEY_1 in Vercel Project Settings → Environment Variables, then redeploy.'
+      error: 'No Groq API keys are configured.',
+      hint: 'Add GROQ_API_KEY_1, GROQ_API_KEY_2, and GROQ_API_KEY_3 in Vercel Environment Variables, then redeploy.'
     });
   }
 
@@ -38,7 +42,6 @@ export default async function handler(req, res) {
     content: `You are NOVA — Your AI Workspace. Answer the user's actual question directly, clearly and helpfully. You can help with school, science, math, technology, coding, writing, planning, brainstorming and everyday questions. Current workspace: ${workspace}. Never pretend a tool or integration exists when it is not connected.${context ? `\n\nUser supplied file context:\n${context}` : ''}`
   };
 
-  // Keep only valid chat messages so malformed frontend data cannot break the request.
   const messages = incomingMessages
     .filter((message) => {
       return message &&
@@ -52,67 +55,76 @@ export default async function handler(req, res) {
     return res.status(400).json({ error: 'No valid chat messages were provided.' });
   }
 
-  try {
-    const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${apiKey}`
-      },
-      body: JSON.stringify({
-        model,
-        messages: [systemMessage, ...messages],
-        temperature: 1,
-        max_completion_tokens: 2048,
-        top_p: 1,
-        reasoning_effort: 'medium',
-        stream: false
-      })
-    });
+  let lastError = null;
 
-    const raw = await response.text();
-    let data = {};
+  // Try each configured key in order. A rate-limit/auth failure moves to the next key.
+  for (let i = 0; i < apiKeys.length; i++) {
+    const apiKey = apiKeys[i];
 
     try {
-      data = raw ? JSON.parse(raw) : {};
-    } catch {
-      data = {};
-    }
+      const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${apiKey}`
+        },
+        body: JSON.stringify({
+          model,
+          messages: [systemMessage, ...messages],
+          temperature: 1,
+          max_completion_tokens: 2048,
+          top_p: 1,
+          reasoning_effort: 'medium',
+          stream: false
+        })
+      });
 
-    if (!response.ok) {
+      const raw = await response.text();
+      let data = {};
+
+      try {
+        data = raw ? JSON.parse(raw) : {};
+      } catch {
+        data = {};
+      }
+
+      if (response.ok) {
+        const answer = data?.choices?.[0]?.message?.content;
+
+        if (typeof answer === 'string' && answer.trim()) {
+          return res.status(200).json({
+            message: answer,
+            model,
+            provider: 'Groq',
+            keySlot: i + 1
+          });
+        }
+
+        lastError = `Groq key ${i + 1} returned no message content.`;
+        continue;
+      }
+
       const detail = data?.error?.message || data?.message || raw || `HTTP ${response.status}`;
+      lastError = `Groq key ${i + 1}: HTTP ${response.status} — ${detail}`;
 
-      return res.status(502).json({
-        error: 'NOVA could not get a response from Groq.',
-        details: `Groq HTTP ${response.status} — ${detail}`,
-        provider: 'Groq',
-        model
-      });
+      // Rotate on rate limits or authentication/permission failures.
+      // For other errors, stop immediately because changing keys is unlikely to help.
+      if (response.status !== 401 && response.status !== 403 && response.status !== 429) {
+        break;
+      }
+    } catch (error) {
+      lastError = `Groq key ${i + 1}: ${error?.message || 'Network error'}`;
+
+      // A network failure may be temporary, so try the next configured key.
+      continue;
     }
-
-    const answer = data?.choices?.[0]?.message?.content;
-
-    if (typeof answer !== 'string' || !answer.trim()) {
-      return res.status(502).json({
-        error: 'Groq returned no message content.',
-        details: 'The Groq request succeeded, but no assistant text was returned.',
-        provider: 'Groq',
-        model
-      });
-    }
-
-    return res.status(200).json({
-      message: answer,
-      model,
-      provider: 'Groq',
-      keySlot: 1
-    });
-  } catch (error) {
-    return res.status(502).json({
-      error: 'NOVA could not reach Groq.',
-      details: error?.message || 'Network error',
-      provider: 'Groq',
-      model
-    });
   }
+
+  return res.status(502).json({
+    error: 'NOVA could not get a response from Groq.',
+    details: lastError || 'All configured Groq keys failed.',
+    provider: 'Groq',
+    model,
+    keysTried: apiKeys.length
+  });
 }
