@@ -186,9 +186,12 @@ export default async function handler(req, res) {
     }
   }
 
+  const failure = lastError || 'All configured Groq keys failed.';
   return res.status(502).json({
-    error: hasImage ? 'NOVA photo vision failed with the Qwen vision models.' : 'NOVA could not get a response from Groq.',
-    details: lastError || 'All configured Groq keys failed.',
+    error: hasImage
+      ? `NOVA photo vision failed with the Qwen vision models.\n\nREAL ERROR: ${failure}`
+      : `NOVA could not get a response from Groq.\n\nREAL ERROR: ${failure}`,
+    details: failure,
     provider: 'Groq',
     model: answerModel,
     keysTried: apiKeys.length,
