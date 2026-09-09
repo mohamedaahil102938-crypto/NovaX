@@ -1,16 +1,19 @@
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
-  const apiKeys = [
+  const groqKeys = [
     process.env.GROQ_API_KEY_1?.trim(),
     process.env.GROQ_API_KEY_2?.trim(),
     process.env.GROQ_API_KEY_3?.trim()
   ].filter(Boolean);
 
-  const answerModel = 'openai/gpt-oss-120b';
-  const visionModels = ['qwen/qwen3.8-27b', 'qwen/qwen3.6-27b'];
+  const geminiKey = process.env.GEMINI_API_KEY_1?.trim();
+  const textModel = 'openai/gpt-oss-120b';
+  const geminiVisionModels = ['gemini-3.8-flash', 'gemini-3.7-flash'];
 
-  if (!apiKeys.length) return res.status(500).json({ error: 'No Groq API keys are configured.' });
+  if (!groqKeys.length && !geminiKey) {
+    return res.status(500).json({ error: 'No AI API keys are configured.' });
+  }
 
   let body = req.body || {};
   if (typeof body === 'string') {
@@ -21,7 +24,10 @@ export default async function handler(req, res) {
   const incomingMessages = Array.isArray(body.messages) ? body.messages : [];
   const workspace = typeof body.workspace === 'string' ? body.workspace : 'Core';
   const context = typeof body.context === 'string' ? body.context.slice(0, 60000) : '';
-  if (!incomingMessages.length) return res.status(400).json({ error: 'Messages are required.' });
+
+  if (!incomingMessages.length) {
+    return res.status(400).json({ error: 'Messages are required.' });
+  }
 
   const messages = incomingMessages.filter(m => {
     if (!m || typeof m !== 'object') return false;
@@ -29,118 +35,178 @@ export default async function handler(req, res) {
     return typeof m.content === 'string' || Array.isArray(m.content);
   }).slice(-30);
 
-  if (!messages.length) return res.status(400).json({ error: 'No valid chat messages were provided.' });
+  if (!messages.length) {
+    return res.status(400).json({ error: 'No valid chat messages were provided.' });
+  }
 
+  // Detect image attachments sent by the existing NovaX frontend.
   const imageParts = [];
   for (const m of messages) {
     if (!Array.isArray(m.content)) continue;
     for (const part of m.content) {
       const url = part?.image_url?.url;
-      if (part?.type === 'image_url' && typeof url === 'string' && /^data:image\/(jpeg|jpg|png|webp);base64,/i.test(url)) {
-        imageParts.push({ type: 'image_url', image_url: { url } });
+      if (
+        part?.type === 'image_url' &&
+        typeof url === 'string' &&
+        /^data:image\/(jpeg|jpg|png|webp);base64,/i.test(url)
+      ) {
+        const match = url.match(/^data:(image\/(?:jpeg|jpg|png|webp));base64,(.*)$/i);
+        if (match) {
+          imageParts.push({
+            mimeType: match[1].toLowerCase(),
+            base64: match[2]
+          });
+        }
       }
     }
   }
 
   const hasImage = imageParts.length > 0;
-  let lastError = null;
 
-  for (let i = 0; i < apiKeys.length; i++) {
-    const apiKey = apiKeys[i];
-    try {
-      let finalMessages;
+  // ------------------------------------------------------------
+  // IMAGE ROUTE: image -> Gemini Vision -> Nova chat response
+  // GPT-OSS is NOT called for image requests.
+  // ------------------------------------------------------------
+  if (hasImage) {
+    if (!geminiKey) {
+      return res.status(500).json({
+        error: 'NOVA image vision is not configured. Add GEMINI_API_KEY_1 to Vercel.'
+      });
+    }
 
-      if (hasImage) {
-        const latestUser = [...messages].reverse().find(m => m.role === 'user');
-        const userText = Array.isArray(latestUser?.content)
-          ? latestUser.content.filter(p => p?.type === 'text').map(p => p.text || '').join(' ').trim()
-          : String(latestUser?.content || '').trim();
+    const latestUser = [...messages].reverse().find(m => m.role === 'user');
+    const userText = Array.isArray(latestUser?.content)
+      ? latestUser.content
+          .filter(p => p?.type === 'text')
+          .map(p => p.text || '')
+          .join(' ')
+          .trim()
+      : String(latestUser?.content || '').trim();
 
-        let visualDescription = '';
-        let visionModelUsed = '';
-        const visionErrors = [];
+    // Keep recent text conversation context, but send the actual image directly to Gemini.
+    const historyText = messages
+      .filter(m => m.role !== 'system')
+      .slice(-12)
+      .map(m => {
+        const text = Array.isArray(m.content)
+          ? m.content.filter(p => p?.type === 'text').map(p => p.text || '').join(' ').trim()
+          : String(m.content || '').trim();
+        return text ? `${m.role === 'assistant' ? 'NOVA' : 'User'}: ${text}` : '';
+      })
+      .filter(Boolean)
+      .join('\n');
 
-        for (const visionModel of visionModels) {
-          try {
-            const visionResponse = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-                Authorization: `Bearer ${apiKey}`
-              },
-              body: JSON.stringify({
-                model: visionModel,
-                messages: [{
-                  role: 'user',
-                  content: [
-                    {
-                      type: 'text',
-                      text: `Analyze this attached photo for NOVA. User request: ${userText || 'Describe the image.'}\nReturn only a detailed factual visual analysis. Identify objects, people, actions, scene, colors, positions, and visible text. Do not invent details.`
-                    },
-                    imageParts[imageParts.length - 1]
-                  ]
-                }],
-                temperature: 0.6,
-                max_completion_tokens: 2048,
-                top_p: 0.95,
-                reasoning_effort: 'default',
-                stream: false
-              })
-            });
+    let lastGeminiError = null;
 
-            const visionRaw = await visionResponse.text();
-            let visionData = {};
-            try { visionData = visionRaw ? JSON.parse(visionRaw) : {}; } catch {}
+    for (const model of geminiVisionModels) {
+      try {
+        const prompt = [
+          'You are NOVA — Your AI Workspace.',
+          'This request contains an uploaded image.',
+          'Answer the user directly from the image and their request.',
+          'Carefully inspect the image. Identify visible objects, people, actions, text, colors, positions, and other relevant details.',
+          'Do not invent details that are not visible.',
+          userText ? `User request: ${userText}` : 'User request: Describe and explain the attached image.',
+          historyText ? `Recent conversation:\n${historyText}` : '',
+          context ? `Relevant document context:\n${context}` : ''
+        ].filter(Boolean).join('\n\n');
 
-            if (visionResponse.ok) {
-              const candidate = visionData?.choices?.[0]?.message?.content;
-              if (typeof candidate === 'string' && candidate.trim()) {
-                visualDescription = candidate.trim();
-                visionModelUsed = visionModel;
-                break;
+        const contents = [
+          {
+            role: 'user',
+            parts: [
+              { text: prompt },
+              {
+                inline_data: {
+                  mime_type: imageParts[imageParts.length - 1].mimeType,
+                  data: imageParts[imageParts.length - 1].base64
+                }
               }
-              visionErrors.push(`${visionModel}: no analysis returned`);
-            } else {
-              const detail = visionData?.error?.message || visionRaw || `HTTP ${visionResponse.status}`;
-              visionErrors.push(`${visionModel}: HTTP ${visionResponse.status} — ${detail}`);
-            }
-          } catch (visionError) {
-            visionErrors.push(`${visionModel}: ${visionError?.message || 'Network error'}`);
+            ]
           }
-        }
+        ];
 
-        if (!visualDescription) {
-          lastError = `Qwen vision key ${i + 1} failed: ${visionErrors.join(' | ')}`;
+        const response = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(geminiKey)}`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              contents,
+              generationConfig: {
+                temperature: 0.7,
+                maxOutputTokens: 2048,
+                topP: 0.95
+              }
+            })
+          }
+        );
+
+        const raw = await response.text();
+        let data = {};
+        try { data = raw ? JSON.parse(raw) : {}; } catch {}
+
+        if (!response.ok) {
+          const detail = data?.error?.message || raw || `HTTP ${response.status}`;
+          lastGeminiError = `Gemini ${model}: HTTP ${response.status} — ${detail}`;
           continue;
         }
 
-        const cleanedMessages = messages.map(m => {
-          if (!Array.isArray(m.content)) return m;
-          const textOnly = m.content.filter(p => p?.type === 'text').map(p => p.text || '').join(' ').trim();
-          return { role: m.role, content: textOnly || (m.role === 'user' ? 'The user attached a photo.' : '') };
-        }).filter(m => m.content || m.role !== 'user');
+        const parts = data?.candidates?.[0]?.content?.parts || [];
+        const answer = parts
+          .map(part => typeof part?.text === 'string' ? part.text : '')
+          .filter(Boolean)
+          .join(' ')
+          .trim();
 
-        finalMessages = [
-          {
-            role: 'system',
-            content: `You are NOVA — Your AI Workspace. Answer directly, clearly, and helpfully. Current workspace: ${workspace}.${context ? `\n\nDocument context:\n${context}` : ''}`
-          },
-          {
-            role: 'system',
-            content: `PHOTO UNDERSTANDING — ${visionModelUsed}:\n${visualDescription}\n\nUse this as the factual visual evidence for the attached photo. Answer the user's request from this evidence. Do not claim the photo is missing or inaccessible, and do not invent unsupported details.`
-          },
-          ...cleanedMessages
-        ];
-      } else {
-        finalMessages = [
-          {
-            role: 'system',
-            content: `You are NOVA — Your AI Workspace. Answer the user's actual question directly, clearly and helpfully. Current workspace: ${workspace}.${context ? `\n\nUser supplied document/file context:\n${context}` : ''}`
-          },
-          ...messages
-        ];
+        if (answer) {
+          return res.status(200).json({
+            message: answer,
+            model,
+            provider: 'Google Gemini',
+            vision: true,
+            visionModel: model,
+            route: 'image-direct-gemini'
+          });
+        }
+
+        lastGeminiError = `Gemini ${model} returned no text content.`;
+      } catch (error) {
+        lastGeminiError = `Gemini ${model}: ${error?.message || 'Network error'}`;
       }
+    }
 
+    return res.status(502).json({
+      error: `NOVA could not process the image with Gemini.\n\nREAL ERROR: ${lastGeminiError || 'All Gemini vision models failed.'}`,
+      details: lastGeminiError || 'All Gemini vision models failed.',
+      provider: 'Google Gemini',
+      vision: true
+    });
+  }
+
+  // ------------------------------------------------------------
+  // TEXT ROUTE: normal messages stay on Groq GPT-OSS-120B.
+  // ------------------------------------------------------------
+  if (!groqKeys.length) {
+    return res.status(500).json({
+      error: 'NOVA text chat is not configured. Add a GROQ_API_KEY_1/2/3 to Vercel.'
+    });
+  }
+
+  const finalMessages = [
+    {
+      role: 'system',
+      content: `You are NOVA — Your AI Workspace. Answer the user's actual question directly, clearly and helpfully. Current workspace: ${workspace}.${context ? `\n\nUser supplied document/file context:\n${context}` : ''}`
+    },
+    ...messages
+  ];
+
+  let lastGroqError = null;
+
+  for (let i = 0; i < groqKeys.length; i++) {
+    const apiKey = groqKeys[i];
+
+    try {
       const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
         method: 'POST',
         headers: {
@@ -148,7 +214,7 @@ export default async function handler(req, res) {
           Authorization: `Bearer ${apiKey}`
         },
         body: JSON.stringify({
-          model: answerModel,
+          model: textModel,
           messages: finalMessages,
           temperature: 1,
           max_completion_tokens: 2048,
@@ -167,34 +233,33 @@ export default async function handler(req, res) {
         if (typeof answer === 'string' && answer.trim()) {
           return res.status(200).json({
             message: answer,
-            model: answerModel,
+            model: textModel,
             provider: 'Groq',
             keySlot: i + 1,
-            vision: hasImage,
-            visionModel: hasImage ? visionModelUsed : null
+            vision: false,
+            route: 'text-gpt-oss'
           });
         }
-        lastError = `Groq key ${i + 1} returned no message content.`;
+
+        lastGroqError = `Groq key ${i + 1} returned no message content.`;
         continue;
       }
 
       const detail = data?.error?.message || data?.message || raw || `HTTP ${response.status}`;
-      lastError = `Groq key ${i + 1}: HTTP ${response.status} — ${detail}`;
+      lastGroqError = `Groq key ${i + 1}: HTTP ${response.status} — ${detail}`;
+
       if (![401, 403, 429].includes(response.status)) break;
     } catch (error) {
-      lastError = `Groq key ${i + 1}: ${error?.message || 'Network error'}`;
+      lastGroqError = `Groq key ${i + 1}: ${error?.message || 'Network error'}`;
     }
   }
 
-  const failure = lastError || 'All configured Groq keys failed.';
   return res.status(502).json({
-    error: hasImage
-      ? `NOVA photo vision failed with the Qwen vision models.\n\nREAL ERROR: ${failure}`
-      : `NOVA could not get a response from Groq.\n\nREAL ERROR: ${failure}`,
-    details: failure,
+    error: `NOVA could not get a response from Groq.\n\nREAL ERROR: ${lastGroqError || 'All configured Groq keys failed.'}`,
+    details: lastGroqError || 'All configured Groq keys failed.',
     provider: 'Groq',
-    model: answerModel,
-    keysTried: apiKeys.length,
-    vision: hasImage
+    model: textModel,
+    keysTried: groqKeys.length,
+    vision: false
   });
 }
