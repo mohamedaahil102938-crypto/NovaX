@@ -8,7 +8,10 @@ export default async function handler(req, res) {
   ].filter(Boolean);
 
   const answerModel = 'openai/gpt-oss-120b';
-  const visionModel = 'meta-llama/llama-4-scout-17b-16e-instruct';
+  const visionModels = [
+    'meta-llama/llama-4-scout-17b-16e-instruct',
+    'meta-llama/llama-4-maverick-17b-128e-instruct'
+  ];
 
   if (!apiKeys.length) {
     return res.status(500).json({ error: 'No Groq API keys are configured.' });
@@ -16,20 +19,17 @@ export default async function handler(req, res) {
 
   let body = req.body || {};
   if (typeof body === 'string') {
-    try { body = JSON.parse(body); } catch {
-      return res.status(400).json({ error: 'Invalid JSON request body.' });
-    }
+    try { body = JSON.parse(body); }
+    catch { return res.status(400).json({ error: 'Invalid JSON request body.' }); }
   }
 
   const incomingMessages = Array.isArray(body.messages) ? body.messages : [];
   const workspace = typeof body.workspace === 'string' ? body.workspace : 'Core';
   const context = typeof body.context === 'string' ? body.context.slice(0, 60000) : '';
-  if (!incomingMessages.length) return res.status(400).json({ error: 'Messages are required.' });
 
-  const hasImage = incomingMessages.some(m =>
-    Array.isArray(m?.content) &&
-    m.content.some(p => p?.type === 'image_url' && typeof p?.image_url?.url === 'string' && p.image_url.url)
-  );
+  if (!incomingMessages.length) {
+    return res.status(400).json({ error: 'Messages are required.' });
+  }
 
   const messages = incomingMessages.filter(m => {
     if (!m || typeof m !== 'object') return false;
@@ -37,8 +37,24 @@ export default async function handler(req, res) {
     return typeof m.content === 'string' || Array.isArray(m.content);
   }).slice(-30);
 
-  if (!messages.length) return res.status(400).json({ error: 'No valid chat messages were provided.' });
+  if (!messages.length) {
+    return res.status(400).json({ error: 'No valid chat messages were provided.' });
+  }
 
+  const imageParts = [];
+  for (const m of messages) {
+    if (!Array.isArray(m.content)) continue;
+    for (const part of m.content) {
+      if (part?.type === 'image_url' && typeof part.image_url?.url === 'string' && part.image_url.url.startsWith('data:image/')) {
+        imageParts.push({
+          type: 'image_url',
+          image_url: { url: part.image_url.url }
+        });
+      }
+    }
+  }
+
+  const hasImage = imageParts.length > 0;
   let lastError = null;
 
   for (let i = 0; i < apiKeys.length; i++) {
@@ -48,20 +64,6 @@ export default async function handler(req, res) {
       let finalMessages;
 
       if (hasImage) {
-        const imageParts = [];
-        for (const m of messages) {
-          if (!Array.isArray(m.content)) continue;
-          for (const part of m.content) {
-            if (part?.type === 'image_url' && typeof part?.image_url?.url === 'string' && part.image_url.url) {
-              imageParts.push({ type: 'image_url', image_url: { url: part.image_url.url } });
-            }
-          }
-        }
-
-        if (!imageParts.length) {
-          return res.status(400).json({ error: 'The photo attachment was not received by NOVA.' });
-        }
-
         const latestUser = [...messages].reverse().find(m => m.role === 'user');
         const userText = Array.isArray(latestUser?.content)
           ? latestUser.content
@@ -71,44 +73,59 @@ export default async function handler(req, res) {
               .trim()
           : String(latestUser?.content || '').trim();
 
-        const visionResponse = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${apiKey}`
-          },
-          body: JSON.stringify({
-            model: visionModel,
-            messages: [{
-              role: 'user',
-              content: [
-                {
-                  type: 'text',
-                  text: `Analyze the attached photo carefully for NOVA. The user's request is: ${userText || 'Describe what is visible.'}\n\nReturn ONLY a detailed factual description of everything relevant in the image: objects, people, text, scene, colors, layout, visible actions, and other useful details. Do not invent anything. This description will be given to another AI that must answer the user. If something is unreadable or uncertain, say so.`
-                },
-                ...imageParts
-              ]
-            }],
-            temperature: 0.1,
-            max_completion_tokens: 3000,
-            stream: false
-          })
-        });
+        let visualDescription = '';
+        let visionSucceeded = false;
 
-        const visionRaw = await visionResponse.text();
-        let visionData = {};
-        try { visionData = visionRaw ? JSON.parse(visionRaw) : {}; } catch {}
+        // Try the primary vision model, then a second multimodal Groq model.
+        for (const visionModel of visionModels) {
+          try {
+            const visionResponse = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                Authorization: `Bearer ${apiKey}`
+              },
+              body: JSON.stringify({
+                model: visionModel,
+                messages: [{
+                  role: 'user',
+                  content: [
+                    {
+                      type: 'text',
+                      text: `You are the image-understanding stage for NOVA. Analyze the attached photo itself. The user's request is: ${userText || 'Describe what is visible.'}\n\nReturn a detailed factual visual analysis for a second AI. Include every relevant visible detail: objects, people, clothing, actions, scene, colors, positions, visible text, numbers, signs, UI elements, and relationships between objects. Read visible text carefully when possible. Do not invent details. Mark anything unclear as uncertain.`
+                    },
+                    ...imageParts.slice(-1)
+                  ]
+                }],
+                temperature: 0,
+                max_completion_tokens: 3000,
+                stream: false
+              })
+            });
 
-        if (!visionResponse.ok) {
-          const detail = visionData?.error?.message || visionRaw || `HTTP ${visionResponse.status}`;
-          lastError = `Groq vision key ${i + 1}: HTTP ${visionResponse.status} — ${detail}`;
-          if ([401, 403, 429].includes(visionResponse.status)) continue;
-          break;
+            const visionRaw = await visionResponse.text();
+            let visionData = {};
+            try { visionData = visionRaw ? JSON.parse(visionRaw) : {}; } catch {}
+
+            if (visionResponse.ok) {
+              const candidate = visionData?.choices?.[0]?.message?.content;
+              if (typeof candidate === 'string' && candidate.trim()) {
+                visualDescription = candidate.trim();
+                visionSucceeded = true;
+                break;
+              }
+              lastError = `Groq vision (${visionModel}) key ${i + 1} returned no analysis.`;
+            } else {
+              const detail = visionData?.error?.message || visionRaw || `HTTP ${visionResponse.status}`;
+              lastError = `Groq vision (${visionModel}) key ${i + 1}: HTTP ${visionResponse.status} — ${detail}`;
+              // Keep trying another vision model/key instead of failing immediately.
+            }
+          } catch (visionError) {
+            lastError = `Groq vision (${visionModel}) key ${i + 1}: ${visionError?.message || 'Network error'}`;
+          }
         }
 
-        const visualDescription = visionData?.choices?.[0]?.message?.content;
-        if (typeof visualDescription !== 'string' || !visualDescription.trim()) {
-          lastError = `Groq vision key ${i + 1} returned no visual analysis.`;
+        if (!visionSucceeded) {
           continue;
         }
 
@@ -125,19 +142,15 @@ export default async function handler(req, res) {
           };
         }).filter(m => m.content || m.role !== 'user');
 
-        // Do NOT tell GPT-OSS that it cannot see images. Give it the successful
-        // visual analysis as explicit evidence and require it to answer from it.
-        const evidenceMessage = {
-          role: 'system',
-          content: `PHOTO ANALYSIS — TRUSTED INPUT FOR THIS TURN:\n${visualDescription}\n\nUse this photo analysis as the factual visual evidence for the user's request. The photo was successfully processed before this response. Answer the user's question directly from the evidence above. Never reply that you cannot see, receive, access, or analyze the photo. Never ask the user to resend the photo unless the evidence explicitly says the image content is unreadable. Do not invent details that are not supported by the photo analysis.`
-        };
-
         finalMessages = [
           {
             role: 'system',
             content: `You are NOVA — Your AI Workspace. Answer directly, clearly, and helpfully. Current workspace: ${workspace}.${context ? `\n\nDocument context:\n${context}` : ''}`
           },
-          evidenceMessage,
+          {
+            role: 'system',
+            content: `PHOTO UNDERSTANDING FOR THE USER'S ATTACHMENT:\n${visualDescription}\n\nThis is the verified visual evidence produced from the photo. Use it to answer the user's request. Do not claim the photo is missing or inaccessible. Do not say you cannot see the image. Do not invent details beyond this evidence.`
+          },
           ...cleanedMessages
         ];
       } else {
