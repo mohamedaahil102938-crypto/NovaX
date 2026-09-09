@@ -10,6 +10,11 @@ export default async function handler(req, res) {
   const geminiKey = process.env.GEMINI_API_KEY_1?.trim();
   const textModel = 'openai/gpt-oss-120b';
   const geminiVisionModels = ['gemini-3.8-flash', 'gemini-3.7-flash'];
+  const geminiImageModels = [
+    process.env.GEMINI_IMAGE_MODEL?.trim(),
+    'gemini-2.5-flash-image',
+    'gemini-2.0-flash-exp-image-generation'
+  ].filter(Boolean);
 
   if (!groqKeys.length && !geminiKey) {
     return res.status(500).json({ error: 'No AI API keys are configured.' });
@@ -39,7 +44,6 @@ export default async function handler(req, res) {
     return res.status(400).json({ error: 'No valid chat messages were provided.' });
   }
 
-  // Detect image attachments sent by the existing NovaX frontend.
   const imageParts = [];
   for (const m of messages) {
     if (!Array.isArray(m.content)) continue;
@@ -62,9 +66,109 @@ export default async function handler(req, res) {
   }
 
   const hasImage = imageParts.length > 0;
+  const latestUser = [...messages].reverse().find(m => m.role === 'user');
+  const userText = Array.isArray(latestUser?.content)
+    ? latestUser.content.filter(p => p?.type === 'text').map(p => p.text || '').join(' ').trim()
+    : String(latestUser?.content || '').trim();
+
+  const imageGenerationRequest = !hasImage && /\b(create|generate|make|draw|render|design|produce)\b[\s\S]{0,80}\b(image|picture|photo|art|illustration|wallpaper|poster|logo|portrait)\b/i.test(userText)
+    || !hasImage && /\b(image|picture|photo|art|illustration|wallpaper|poster)\b[\s\S]{0,40}\b(generate|create|make|draw|render)\b/i.test(userText);
 
   // ------------------------------------------------------------
-  // IMAGE ROUTE: image -> Gemini Vision -> Nova chat response
+  // IMAGE GENERATION ROUTE: prompt -> Gemini image model -> NOVA chat bubble
+  // Never falls back to a paid provider or to GPT-OSS for image rendering.
+  // ------------------------------------------------------------
+  if (imageGenerationRequest) {
+    if (!geminiKey) {
+      return res.status(500).json({
+        error: 'NOVA image generation is not configured. Add GEMINI_API_KEY_1 to Vercel.'
+      });
+    }
+
+    let lastImageError = null;
+
+    for (const model of geminiImageModels) {
+      try {
+        const prompt = [
+          'Create the requested image for NOVA.',
+          'Generate the visual itself, not a description of it.',
+          'Follow the user request closely and produce a polished result.',
+          `User request: ${userText || 'Create an image.'}`,
+          context ? `Relevant context:\n${context}` : ''
+        ].filter(Boolean).join('\n\n');
+
+        const response = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(geminiKey)}`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              contents: [{
+                role: 'user',
+                parts: [{ text: prompt }]
+              }],
+              generationConfig: {
+                responseModalities: ['TEXT', 'IMAGE'],
+                temperature: 1
+              }
+            })
+          }
+        );
+
+        const raw = await response.text();
+        let data = {};
+        try { data = raw ? JSON.parse(raw) : {}; } catch {}
+
+        if (!response.ok) {
+          const detail = data?.error?.message || raw || `HTTP ${response.status}`;
+          lastImageError = `Gemini image model ${model}: HTTP ${response.status} — ${detail}`;
+          continue;
+        }
+
+        const parts = data?.candidates?.[0]?.content?.parts || [];
+        let image = null;
+        let answerText = '';
+
+        for (const part of parts) {
+          const inline = part?.inlineData || part?.inline_data;
+          if (inline?.data && inline?.mimeType?.startsWith('image/')) {
+            image = {
+              mimeType: inline.mimeType,
+              data: inline.data
+            };
+          }
+          if (typeof part?.text === 'string' && part.text.trim()) {
+            answerText += `${answerText ? '\n' : ''}${part.text.trim()}`;
+          }
+        }
+
+        if (image) {
+          return res.status(200).json({
+            message: answerText || 'Here is your image.',
+            image,
+            model,
+            provider: 'Google Gemini',
+            vision: false,
+            route: 'image-generation-gemini'
+          });
+        }
+
+        lastImageError = `Gemini image model ${model} returned no image data.`;
+      } catch (error) {
+        lastImageError = `Gemini image model ${model}: ${error?.message || 'Network error'}`;
+      }
+    }
+
+    return res.status(502).json({
+      error: `NOVA could not generate the image with Gemini.\n\nREAL ERROR: ${lastImageError || 'All configured Gemini image models failed.'}`,
+      details: lastImageError || 'All configured Gemini image models failed.',
+      provider: 'Google Gemini',
+      route: 'image-generation-gemini'
+    });
+  }
+
+  // ------------------------------------------------------------
+  // IMAGE ROUTE: image -> Gemini Vision -> direct Gemini answer
   // GPT-OSS is NOT called for image requests.
   // ------------------------------------------------------------
   if (hasImage) {
@@ -74,16 +178,6 @@ export default async function handler(req, res) {
       });
     }
 
-    const latestUser = [...messages].reverse().find(m => m.role === 'user');
-    const userText = Array.isArray(latestUser?.content)
-      ? latestUser.content
-          .filter(p => p?.type === 'text')
-          .map(p => p.text || '')
-          .join(' ')
-          .trim()
-      : String(latestUser?.content || '').trim();
-
-    // Keep recent text conversation context, but send the actual image directly to Gemini.
     const historyText = messages
       .filter(m => m.role !== 'system')
       .slice(-12)
@@ -111,20 +205,19 @@ export default async function handler(req, res) {
           context ? `Relevant document context:\n${context}` : ''
         ].filter(Boolean).join('\n\n');
 
-        const contents = [
-          {
-            role: 'user',
-            parts: [
-              { text: prompt },
-              {
-                inline_data: {
-                  mime_type: imageParts[imageParts.length - 1].mimeType,
-                  data: imageParts[imageParts.length - 1].base64
-                }
+        const lastImage = imageParts[imageParts.length - 1];
+        const contents = [{
+          role: 'user',
+          parts: [
+            { text: prompt },
+            {
+              inline_data: {
+                mime_type: lastImage.mimeType,
+                data: lastImage.base64
               }
-            ]
-          }
-        ];
+            }
+          ]
+        }];
 
         const response = await fetch(
           `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(geminiKey)}`,
