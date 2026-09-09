@@ -1,84 +1,121 @@
 export default async function handler(req, res) {
-  if (req.method !== 'POST') {
-    return res.status(405).json({ error: 'Method not allowed' });
-  }
+  if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
-  // Groq only — all AI chat/vision requests use GPT-OSS-120B.
   const apiKeys = [
     process.env.GROQ_API_KEY_1?.trim(),
     process.env.GROQ_API_KEY_2?.trim(),
     process.env.GROQ_API_KEY_3?.trim()
   ].filter(Boolean);
 
-  const model = 'openai/gpt-oss-120b';
+  const answerModel = 'openai/gpt-oss-120b';
+  // GPT-OSS-120B is text-only. Groq's multimodal model is used only to turn pixels into a description;
+  // GPT-OSS-120B remains the model that produces NOVA's final answer.
+  const visionModel = 'meta-llama/llama-4-scout-17b-16e-instruct';
 
   if (!apiKeys.length) {
-    return res.status(500).json({
-      error: 'No Groq API keys are configured.',
-      hint: 'Add GROQ_API_KEY_1, GROQ_API_KEY_2, and GROQ_API_KEY_3 in Vercel Environment Variables, then redeploy.'
-    });
+    return res.status(500).json({ error: 'No Groq API keys are configured.' });
   }
 
   let body = req.body || {};
   if (typeof body === 'string') {
-    try {
-      body = JSON.parse(body);
-    } catch {
-      return res.status(400).json({ error: 'Invalid JSON request body.' });
-    }
+    try { body = JSON.parse(body); } catch { return res.status(400).json({ error: 'Invalid JSON request body.' }); }
   }
 
   const incomingMessages = Array.isArray(body.messages) ? body.messages : [];
   const workspace = typeof body.workspace === 'string' ? body.workspace : 'Core';
   const context = typeof body.context === 'string' ? body.context.slice(0, 60000) : '';
+  if (!incomingMessages.length) return res.status(400).json({ error: 'Messages are required.' });
 
-  if (!incomingMessages.length) {
-    return res.status(400).json({ error: 'Messages are required.' });
-  }
+  const hasImage = incomingMessages.some(m => Array.isArray(m?.content) && m.content.some(p => p?.type === 'image_url' && p?.image_url?.url));
 
-  const hasImage = incomingMessages.some((message) =>
-    Array.isArray(message?.content) &&
-    message.content.some((part) => part?.type === 'image_url' && part?.image_url?.url)
-  );
-
-  const systemMessage = {
-    role: 'system',
-    content: `You are NOVA — Your AI Workspace. Answer the user's actual question directly, clearly and helpfully. You can help with school, science, math, technology, coding, writing, planning, brainstorming, documents, images and everyday questions. Current workspace: ${workspace}. Never pretend a tool or integration exists when it is not connected.
-
-When an image is attached, use the image input to analyze what is visible and answer the user's question about it. If the user asks to transform or edit the image, describe the requested transformation accurately, but do not claim that a new image was rendered unless a real image-generation tool is connected. When documents are supplied as extracted text, use that text as the source and say when something is not present in the supplied document.${context ? `
-
-User supplied document/file context:
-${context}` : ''}`
-  };
-
-  const messages = incomingMessages
-    .filter((message) => {
-      if (!message || typeof message !== 'object') return false;
-      if (!['user', 'assistant', 'system'].includes(message.role)) return false;
-      return typeof message.content === 'string' || Array.isArray(message.content);
-    })
-    .slice(-30);
-
-  if (!messages.length) {
-    return res.status(400).json({ error: 'No valid chat messages were provided.' });
-  }
+  const messages = incomingMessages.filter(m => {
+    if (!m || typeof m !== 'object') return false;
+    if (!['user','assistant','system'].includes(m.role)) return false;
+    return typeof m.content === 'string' || Array.isArray(m.content);
+  }).slice(-30);
+  if (!messages.length) return res.status(400).json({ error: 'No valid chat messages were provided.' });
 
   let lastError = null;
 
-  // Rotate through the three Groq keys. A rate-limit/auth failure moves to the next key.
   for (let i = 0; i < apiKeys.length; i++) {
     const apiKey = apiKeys[i];
-
     try {
+      let finalMessages = messages;
+
+      if (hasImage) {
+        const imageParts = [];
+        for (const m of messages) {
+          if (Array.isArray(m.content)) {
+            for (const part of m.content) {
+              if (part?.type === 'image_url' && part?.image_url?.url) imageParts.push(part);
+            }
+          }
+        }
+
+        if (!imageParts.length) return res.status(400).json({ error: 'The photo attachment was not received by NOVA.' });
+
+        const latestUser = [...messages].reverse().find(m => m.role === 'user');
+        const userText = Array.isArray(latestUser?.content)
+          ? latestUser.content.filter(p => p?.type === 'text').map(p => p.text || '').join(' ')
+          : String(latestUser?.content || '');
+
+        const visionResponse = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+          body: JSON.stringify({
+            model: visionModel,
+            messages: [{
+              role: 'user',
+              content: [
+                { type: 'text', text: `Inspect this image carefully. The user's question/request is: ${userText || 'Describe what is visible.'}\nReturn a detailed factual visual description that another AI can use to answer the user. Do not invent details.` },
+                ...imageParts
+              ]
+            }],
+            temperature: 0.2,
+            max_completion_tokens: 2048,
+            stream: false
+          })
+        });
+
+        const visionRaw = await visionResponse.text();
+        let visionData = {};
+        try { visionData = visionRaw ? JSON.parse(visionRaw) : {}; } catch {}
+
+        if (!visionResponse.ok) {
+          const detail = visionData?.error?.message || visionRaw || `HTTP ${visionResponse.status}`;
+          lastError = `Groq vision key ${i + 1}: HTTP ${visionResponse.status} — ${detail}`;
+          if ([401,403,429].includes(visionResponse.status)) continue;
+          break;
+        }
+
+        const visualDescription = visionData?.choices?.[0]?.message?.content;
+        if (typeof visualDescription !== 'string' || !visualDescription.trim()) {
+          lastError = `Groq vision key ${i + 1} returned no visual description.`;
+          continue;
+        }
+
+        const cleaned = messages.map(m => {
+          if (m.role !== 'user' || !Array.isArray(m.content)) return m;
+          return { ...m, content: m.content.filter(p => p?.type === 'text').map(p => p.text || '').join(' ').trim() || 'The user attached an image.' };
+        });
+
+        finalMessages = [
+          { role: 'system', content: `You are NOVA — Your AI Workspace. Answer directly and helpfully. The final answer must be produced by GPT-OSS-120B. A separate Groq vision step inspected the user's image because GPT-OSS-120B itself cannot accept image pixels. Treat the visual description below as the image evidence. Do not say you directly saw pixels. If the user asks to edit/transform the image, explain the requested edit but do not claim a rendered image exists unless a real image generator is connected. Current workspace: ${workspace}.${context ? `\n\nDocument context:\n${context}` : ''}\n\nVISUAL EVIDENCE FROM THE ATTACHED PHOTO:\n${visualDescription}` },
+          ...cleaned
+        ];
+      } else {
+        finalMessages = [
+          { role: 'system', content: `You are NOVA — Your AI Workspace. Answer the user's actual question directly, clearly and helpfully. Current workspace: ${workspace}.${context ? `\n\nUser supplied document/file context:\n${context}` : ''}` },
+          ...messages
+        ];
+      }
+
       const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${apiKey}`
-        },
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
         body: JSON.stringify({
-          model,
-          messages: [systemMessage, ...messages],
+          model: answerModel,
+          messages: finalMessages,
           temperature: 1,
           max_completion_tokens: 2048,
           top_p: 1,
@@ -89,22 +126,12 @@ ${context}` : ''}`
 
       const raw = await response.text();
       let data = {};
-      try {
-        data = raw ? JSON.parse(raw) : {};
-      } catch {
-        data = {};
-      }
+      try { data = raw ? JSON.parse(raw) : {}; } catch {}
 
       if (response.ok) {
         const answer = data?.choices?.[0]?.message?.content;
         if (typeof answer === 'string' && answer.trim()) {
-          return res.status(200).json({
-            message: answer,
-            model,
-            provider: 'Groq',
-            keySlot: i + 1,
-            vision: hasImage
-          });
+          return res.status(200).json({ message: answer, model: answerModel, provider: 'Groq', keySlot: i + 1, vision: hasImage });
         }
         lastError = `Groq key ${i + 1} returned no message content.`;
         continue;
@@ -112,22 +139,15 @@ ${context}` : ''}`
 
       const detail = data?.error?.message || data?.message || raw || `HTTP ${response.status}`;
       lastError = `Groq key ${i + 1}: HTTP ${response.status} — ${detail}`;
-
-      if (response.status !== 401 && response.status !== 403 && response.status !== 429) {
-        break;
-      }
+      if (![401,403,429].includes(response.status)) break;
     } catch (error) {
       lastError = `Groq key ${i + 1}: ${error?.message || 'Network error'}`;
     }
   }
 
   return res.status(502).json({
-    error: hasImage
-      ? 'NOVA could not analyze the image with Groq GPT-OSS-120B.'
-      : 'NOVA could not get a response from Groq GPT-OSS-120B.',
+    error: hasImage ? 'NOVA could not process the attached photo with Groq.' : 'NOVA could not get a response from Groq.',
     details: lastError || 'All configured Groq keys failed.',
-    provider: 'Groq',
-    model,
-    keysTried: apiKeys.length
+    provider: 'Groq', model: answerModel, keysTried: apiKeys.length, vision: hasImage
   });
 }
