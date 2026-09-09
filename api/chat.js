@@ -9,8 +9,9 @@ export default async function handler(req, res) {
 
   const answerModel = 'openai/gpt-oss-120b';
   const visionModels = [
-    'meta-llama/llama-4-scout-17b-16e-instruct',
-    'meta-llama/llama-4-maverick-17b-128e-instruct'
+    'qwen/qwen3.8-27b',
+    'qwen/qwen3.6-27b',
+    'meta-llama/llama-4-scout-17b-16e-instruct'
   ];
 
   if (!apiKeys.length) {
@@ -74,9 +75,10 @@ export default async function handler(req, res) {
           : String(latestUser?.content || '').trim();
 
         let visualDescription = '';
+        let visionModelUsed = '';
         let visionSucceeded = false;
 
-        // Try the primary vision model, then a second multimodal Groq model.
+        // Try Qwen 3.8 first, then Qwen 3.6, then Scout as a final fallback.
         for (const visionModel of visionModels) {
           try {
             const visionResponse = await fetch('https://api.groq.com/openai/v1/chat/completions', {
@@ -97,8 +99,10 @@ export default async function handler(req, res) {
                     ...imageParts.slice(-1)
                   ]
                 }],
-                temperature: 0,
+                temperature: 0.1,
                 max_completion_tokens: 3000,
+                top_p: 0.95,
+                reasoning_effort: 'default',
                 stream: false
               })
             });
@@ -111,6 +115,7 @@ export default async function handler(req, res) {
               const candidate = visionData?.choices?.[0]?.message?.content;
               if (typeof candidate === 'string' && candidate.trim()) {
                 visualDescription = candidate.trim();
+                visionModelUsed = visionModel;
                 visionSucceeded = true;
                 break;
               }
@@ -118,7 +123,6 @@ export default async function handler(req, res) {
             } else {
               const detail = visionData?.error?.message || visionRaw || `HTTP ${visionResponse.status}`;
               lastError = `Groq vision (${visionModel}) key ${i + 1}: HTTP ${visionResponse.status} — ${detail}`;
-              // Keep trying another vision model/key instead of failing immediately.
             }
           } catch (visionError) {
             lastError = `Groq vision (${visionModel}) key ${i + 1}: ${visionError?.message || 'Network error'}`;
@@ -149,7 +153,7 @@ export default async function handler(req, res) {
           },
           {
             role: 'system',
-            content: `PHOTO UNDERSTANDING FOR THE USER'S ATTACHMENT:\n${visualDescription}\n\nThis is the verified visual evidence produced from the photo. Use it to answer the user's request. Do not claim the photo is missing or inaccessible. Do not say you cannot see the image. Do not invent details beyond this evidence.`
+            content: `PHOTO UNDERSTANDING FOR THE USER'S ATTACHMENT (analyzed by ${visionModelUsed}):\n${visualDescription}\n\nThis is the visual evidence produced from the photo. Use it to answer the user's request. Do not claim the photo is missing or inaccessible. Do not say you cannot see the image. Do not invent details beyond this evidence.`
           },
           ...cleanedMessages
         ];
@@ -192,7 +196,8 @@ export default async function handler(req, res) {
             model: answerModel,
             provider: 'Groq',
             keySlot: i + 1,
-            vision: hasImage
+            vision: hasImage,
+            visionModel: hasImage ? visionModelUsed : null
           });
         }
         lastError = `Groq key ${i + 1} returned no message content.`;
