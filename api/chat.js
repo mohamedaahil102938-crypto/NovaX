@@ -6,7 +6,18 @@ export default async function handler(req, res) {
   const hfToken = process.env.HF_TOKEN?.trim();
   const textModel = 'openai/gpt-oss-120b';
   const geminiVisionModels = ['gemini-3.8-flash', 'gemini-3.7-flash'];
-  const hfImageModel = process.env.HF_IMAGE_MODEL?.trim() || 'stabilityai/stable-diffusion-3.5-large';
+
+  const hfTextToImageModels = (process.env.HF_TEXT2IMAGE_MODELS || [
+    'GSAI-ML/LLaDA-Image-8B',
+    'stabilityai/stable-diffusion-3.5-large',
+    'stabilityai/stable-diffusion-xl-base-1.0',
+    'runwayml/stable-diffusion-v1-5'
+  ].join(',')).split(',').map(s => s.trim()).filter(Boolean);
+
+  const hfImageToImageModels = (process.env.HF_IMAGE2IMAGE_MODELS || [
+    'timbrooks/instruct-pix2pix',
+    'GSAI-ML/LLaDA-Image-8B'
+  ].join(',')).split(',').map(s => s.trim()).filter(Boolean);
 
   if (!groqKeys.length && !geminiKey && !hfToken) return res.status(500).json({ error: 'No AI API keys are configured.' });
 
@@ -43,41 +54,105 @@ export default async function handler(req, res) {
 
   const imageGenerationRequest = (!hasImage && /\b(create|generate|make|draw|render|design|produce)\b[\s\S]{0,80}\b(image|picture|photo|art|illustration|wallpaper|poster|logo|portrait)\b/i.test(userText)) || (!hasImage && /\b(image|picture|photo|art|illustration|wallpaper|poster)\b[\s\S]{0,40}\b(generate|create|make|draw|render)\b/i.test(userText));
 
-  // IMAGE GENERATION: Hugging Face only. No paid fallback.
+  const imageToImageRequest = hasImage && /\b(edit|change|modify|transform|restyle|redesign|remove|replace|add|turn|convert|make|generate|create|draw|render)\b/i.test(userText) && /\b(image|photo|picture|it|this|that|background|person|object|style|color|clothes|face)\b/i.test(userText);
+
+  // TEXT-TO-IMAGE: try multiple Hugging Face hosted models in sequence. No paid fallback.
   if (imageGenerationRequest) {
     if (!hfToken) return res.status(500).json({ error: 'NOVA image generation is not configured. Add HF_TOKEN to Vercel.' });
 
     const prompt = ['Create the requested image.', 'Generate the visual itself, not a description of it.', 'Follow the user request closely and produce a polished result.', `User request: ${userText || 'Create an image.'}`, context ? `Relevant context:\n${context}` : ''].filter(Boolean).join('\n\n');
+    const failures = [];
 
-    try {
-      const response = await fetch(`https://router.huggingface.co/hf-inference/models/${hfImageModel}`, {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${hfToken}`, 'Content-Type': 'application/json', Accept: 'image/png' },
-        body: JSON.stringify({ inputs: prompt })
-      });
+    for (const model of hfTextToImageModels) {
+      try {
+        const response = await fetch(`https://router.huggingface.co/hf-inference/models/${encodeURIComponent(model)}`, {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${hfToken}`, 'Content-Type': 'application/json', Accept: 'image/png' },
+          body: JSON.stringify({ inputs: prompt })
+        });
 
-      const raw = await response.arrayBuffer();
-      const contentType = response.headers.get('content-type') || '';
+        const raw = await response.arrayBuffer();
+        const contentType = response.headers.get('content-type') || '';
 
-      if (!response.ok) {
-        let detail = '';
-        try {
-          detail = new TextDecoder().decode(raw);
-          const parsed = detail ? JSON.parse(detail) : {};
-          detail = parsed?.error || parsed?.message || detail;
-        } catch {}
-        return res.status(502).json({ error: `NOVA could not generate the image with Hugging Face.\n\nREAL ERROR: Hugging Face ${hfImageModel}: HTTP ${response.status} — ${detail || 'Image inference failed.'}`, details: detail || `HTTP ${response.status}`, provider: 'Hugging Face', model: hfImageModel, route: 'image-generation-huggingface' });
+        if (!response.ok) {
+          let detail = '';
+          try {
+            detail = new TextDecoder().decode(raw);
+            const parsed = detail ? JSON.parse(detail) : {};
+            detail = parsed?.error || parsed?.message || detail;
+          } catch {}
+          failures.push(`${model}: HTTP ${response.status} — ${detail || 'Inference failed.'}`);
+          continue;
+        }
+
+        if (!contentType.toLowerCase().startsWith('image/')) {
+          let detail = '';
+          try { detail = new TextDecoder().decode(raw); } catch {}
+          failures.push(`${model}: returned ${contentType || 'non-image'} instead of image data${detail ? ` — ${detail.slice(0, 500)}` : ''}`);
+          continue;
+        }
+
+        return res.status(200).json({ message: 'Here is your image.', image: { mimeType: contentType.split(';')[0].trim() || 'image/png', data: Buffer.from(raw).toString('base64') }, model, provider: 'Hugging Face', vision: false, route: 'text-to-image-huggingface' });
+      } catch (error) {
+        failures.push(`${model}: ${error?.message || 'Network error'}`);
       }
-
-      if (!contentType.toLowerCase().startsWith('image/')) {
-        let detail = ''; try { detail = new TextDecoder().decode(raw); } catch {}
-        return res.status(502).json({ error: `NOVA could not generate the image with Hugging Face.\n\nREAL ERROR: Hugging Face returned ${contentType || 'non-image'} instead of image data${detail ? ` — ${detail.slice(0, 1000)}` : '.'}`, details: detail || 'Non-image response.', provider: 'Hugging Face', model: hfImageModel, route: 'image-generation-huggingface' });
-      }
-
-      return res.status(200).json({ message: 'Here is your image.', image: { mimeType: contentType.split(';')[0].trim() || 'image/png', data: Buffer.from(raw).toString('base64') }, model: hfImageModel, provider: 'Hugging Face', vision: false, route: 'image-generation-huggingface' });
-    } catch (error) {
-      return res.status(502).json({ error: `NOVA could not generate the image with Hugging Face.\n\nREAL ERROR: ${error?.message || 'Network error'}`, details: error?.message || 'Network error', provider: 'Hugging Face', model: hfImageModel, route: 'image-generation-huggingface' });
     }
+
+    return res.status(502).json({ error: `NOVA could not generate the image with the configured Hugging Face models.\n\nTRIED ${hfTextToImageModels.length} MODELS:\n${failures.join('\n')}`, details: failures.join('\n'), provider: 'Hugging Face', modelsTried: hfTextToImageModels, route: 'text-to-image-huggingface' });
+  }
+
+  // IMAGE-TO-IMAGE: try hosted image-editing models before falling back to Gemini vision.
+  if (imageToImageRequest) {
+    if (!hfToken) return res.status(500).json({ error: 'NOVA image-to-image is not configured. Add HF_TOKEN to Vercel.' });
+
+    const lastImage = imageParts[imageParts.length - 1];
+    const failures = [];
+    const imageDataUrl = `data:${lastImage.mimeType};base64,${lastImage.base64}`;
+
+    for (const model of hfImageToImageModels) {
+      const payloads = [
+        { inputs: { prompt: userText || 'Edit this image as requested.', image: imageDataUrl } },
+        { inputs: { prompt: userText || 'Edit this image as requested.', image: lastImage.base64 } },
+        { inputs: userText || 'Edit this image as requested.', image: lastImage.base64 }
+      ];
+
+      for (let attempt = 0; attempt < payloads.length; attempt++) {
+        try {
+          const response = await fetch(`https://router.huggingface.co/hf-inference/models/${encodeURIComponent(model)}`, {
+            method: 'POST',
+            headers: { Authorization: `Bearer ${hfToken}`, 'Content-Type': 'application/json', Accept: 'image/png' },
+            body: JSON.stringify(payloads[attempt])
+          });
+
+          const raw = await response.arrayBuffer();
+          const contentType = response.headers.get('content-type') || '';
+
+          if (!response.ok) {
+            let detail = '';
+            try {
+              detail = new TextDecoder().decode(raw);
+              const parsed = detail ? JSON.parse(detail) : {};
+              detail = parsed?.error || parsed?.message || detail;
+            } catch {}
+            failures.push(`${model} attempt ${attempt + 1}: HTTP ${response.status} — ${detail || 'Inference failed.'}`);
+            continue;
+          }
+
+          if (!contentType.toLowerCase().startsWith('image/')) {
+            let detail = '';
+            try { detail = new TextDecoder().decode(raw); } catch {}
+            failures.push(`${model} attempt ${attempt + 1}: returned ${contentType || 'non-image'} instead of image data${detail ? ` — ${detail.slice(0, 500)}` : ''}`);
+            continue;
+          }
+
+          return res.status(200).json({ message: 'Here is the edited image.', image: { mimeType: contentType.split(';')[0].trim() || 'image/png', data: Buffer.from(raw).toString('base64') }, model, provider: 'Hugging Face', vision: false, route: 'image-to-image-huggingface' });
+        } catch (error) {
+          failures.push(`${model} attempt ${attempt + 1}: ${error?.message || 'Network error'}`);
+        }
+      }
+    }
+
+    return res.status(502).json({ error: `NOVA could not edit the image with the configured Hugging Face image-to-image models.\n\nTRIED ${hfImageToImageModels.length} MODELS / ${hfImageToImageModels.length * 3} REQUEST FORMATS:\n${failures.join('\n')}`, details: failures.join('\n'), provider: 'Hugging Face', modelsTried: hfImageToImageModels, route: 'image-to-image-huggingface' });
   }
 
   // IMAGE VISION: Gemini only, direct Gemini answer. GPT-OSS is bypassed.
