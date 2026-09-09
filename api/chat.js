@@ -6,7 +6,7 @@ export default async function handler(req, res) {
   const hfToken = process.env.HF_TOKEN?.trim();
   const textModel = 'openai/gpt-oss-120b';
   const geminiVisionModels = ['gemini-3.8-flash', 'gemini-3.7-flash'];
-  const hfImageModel = process.env.HF_IMAGE_MODEL?.trim() || 'black-forest-labs/FLUX.1-schnell';
+  const hfImageModel = process.env.HF_IMAGE_MODEL?.trim() || 'stabilityai/stable-diffusion-3.5-large';
 
   if (!groqKeys.length && !geminiKey && !hfToken) return res.status(500).json({ error: 'No AI API keys are configured.' });
 
