@@ -10,11 +10,8 @@ export default async function handler(req, res) {
   const geminiKey = process.env.GEMINI_API_KEY_1?.trim();
   const textModel = 'openai/gpt-oss-120b';
   const geminiVisionModels = ['gemini-3.8-flash', 'gemini-3.7-flash'];
-  const geminiImageModels = [
-    process.env.GEMINI_IMAGE_MODEL?.trim(),
-    'gemini-2.5-flash-image',
-    'gemini-2.0-flash-exp-image-generation'
-  ].filter(Boolean);
+  const configuredImageModel = process.env.GEMINI_IMAGE_MODEL?.trim();
+  const geminiImageModels = [configuredImageModel || 'gemini-2.5-flash-image'];
 
   if (!groqKeys.length && !geminiKey) {
     return res.status(500).json({ error: 'No AI API keys are configured.' });
@@ -56,10 +53,7 @@ export default async function handler(req, res) {
       ) {
         const match = url.match(/^data:(image\/(?:jpeg|jpg|png|webp));base64,(.*)$/i);
         if (match) {
-          imageParts.push({
-            mimeType: match[1].toLowerCase(),
-            base64: match[2]
-          });
+          imageParts.push({ mimeType: match[1].toLowerCase(), base64: match[2] });
         }
       }
     }
@@ -71,13 +65,16 @@ export default async function handler(req, res) {
     ? latestUser.content.filter(p => p?.type === 'text').map(p => p.text || '').join(' ').trim()
     : String(latestUser?.content || '').trim();
 
-  const imageGenerationRequest = !hasImage && /\b(create|generate|make|draw|render|design|produce)\b[\s\S]{0,80}\b(image|picture|photo|art|illustration|wallpaper|poster|logo|portrait)\b/i.test(userText)
-    || !hasImage && /\b(image|picture|photo|art|illustration|wallpaper|poster)\b[\s\S]{0,40}\b(generate|create|make|draw|render)\b/i.test(userText);
+  const imageGenerationRequest = (
+    !hasImage &&
+    /\b(create|generate|make|draw|render|design|produce)\b[\s\S]{0,80}\b(image|picture|photo|art|illustration|wallpaper|poster|logo|portrait)\b/i.test(userText)
+  ) || (
+    !hasImage &&
+    /\b(image|picture|photo|art|illustration|wallpaper|poster)\b[\s\S]{0,40}\b(generate|create|make|draw|render)\b/i.test(userText)
+  );
 
-  // ------------------------------------------------------------
-  // IMAGE GENERATION ROUTE: prompt -> Gemini image model -> NOVA chat bubble
-  // Never falls back to a paid provider or to GPT-OSS for image rendering.
-  // ------------------------------------------------------------
+  // IMAGE GENERATION: prompt -> Gemini image model -> image data -> existing Nova chat UI.
+  // No Groq fallback and no obsolete experimental model fallback.
   if (imageGenerationRequest) {
     if (!geminiKey) {
       return res.status(500).json({
@@ -103,14 +100,8 @@ export default async function handler(req, res) {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-              contents: [{
-                role: 'user',
-                parts: [{ text: prompt }]
-              }],
-              generationConfig: {
-                responseModalities: ['TEXT', 'IMAGE'],
-                temperature: 1
-              }
+              contents: [{ role: 'user', parts: [{ text: prompt }] }],
+              generationConfig: { responseModalities: ['TEXT', 'IMAGE'], temperature: 1 }
             })
           }
         );
@@ -132,10 +123,7 @@ export default async function handler(req, res) {
         for (const part of parts) {
           const inline = part?.inlineData || part?.inline_data;
           if (inline?.data && inline?.mimeType?.startsWith('image/')) {
-            image = {
-              mimeType: inline.mimeType,
-              data: inline.data
-            };
+            image = { mimeType: inline.mimeType, data: inline.data };
           }
           if (typeof part?.text === 'string' && part.text.trim()) {
             answerText += `${answerText ? '\n' : ''}${part.text.trim()}`;
@@ -160,17 +148,14 @@ export default async function handler(req, res) {
     }
 
     return res.status(502).json({
-      error: `NOVA could not generate the image with Gemini.\n\nREAL ERROR: ${lastImageError || 'All configured Gemini image models failed.'}`,
-      details: lastImageError || 'All configured Gemini image models failed.',
+      error: `NOVA could not generate the image with Gemini.\n\nREAL ERROR: ${lastImageError || 'The configured Gemini image model failed.'}`,
+      details: lastImageError || 'The configured Gemini image model failed.',
       provider: 'Google Gemini',
       route: 'image-generation-gemini'
     });
   }
 
-  // ------------------------------------------------------------
-  // IMAGE ROUTE: image -> Gemini Vision -> direct Gemini answer
-  // GPT-OSS is NOT called for image requests.
-  // ------------------------------------------------------------
+  // IMAGE VISION: image -> Gemini Vision -> direct Gemini answer.
   if (hasImage) {
     if (!geminiKey) {
       return res.status(500).json({
@@ -206,31 +191,20 @@ export default async function handler(req, res) {
         ].filter(Boolean).join('\n\n');
 
         const lastImage = imageParts[imageParts.length - 1];
-        const contents = [{
-          role: 'user',
-          parts: [
-            { text: prompt },
-            {
-              inline_data: {
-                mime_type: lastImage.mimeType,
-                data: lastImage.base64
-              }
-            }
-          ]
-        }];
-
         const response = await fetch(
           `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(geminiKey)}`,
           {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-              contents,
-              generationConfig: {
-                temperature: 0.7,
-                maxOutputTokens: 2048,
-                topP: 0.95
-              }
+              contents: [{
+                role: 'user',
+                parts: [
+                  { text: prompt },
+                  { inline_data: { mime_type: lastImage.mimeType, data: lastImage.base64 } }
+                ]
+              }],
+              generationConfig: { temperature: 0.7, maxOutputTokens: 2048, topP: 0.95 }
             })
           }
         );
@@ -246,21 +220,10 @@ export default async function handler(req, res) {
         }
 
         const parts = data?.candidates?.[0]?.content?.parts || [];
-        const answer = parts
-          .map(part => typeof part?.text === 'string' ? part.text : '')
-          .filter(Boolean)
-          .join(' ')
-          .trim();
+        const answer = parts.map(part => typeof part?.text === 'string' ? part.text : '').filter(Boolean).join(' ').trim();
 
         if (answer) {
-          return res.status(200).json({
-            message: answer,
-            model,
-            provider: 'Google Gemini',
-            vision: true,
-            visionModel: model,
-            route: 'image-direct-gemini'
-          });
+          return res.status(200).json({ message: answer, model, provider: 'Google Gemini', vision: true, visionModel: model, route: 'image-direct-gemini' });
         }
 
         lastGeminiError = `Gemini ${model} returned no text content.`;
@@ -277,13 +240,9 @@ export default async function handler(req, res) {
     });
   }
 
-  // ------------------------------------------------------------
-  // TEXT ROUTE: normal messages stay on Groq GPT-OSS-120B.
-  // ------------------------------------------------------------
+  // TEXT: normal messages stay on Groq GPT-OSS-120B.
   if (!groqKeys.length) {
-    return res.status(500).json({
-      error: 'NOVA text chat is not configured. Add a GROQ_API_KEY_1/2/3 to Vercel.'
-    });
+    return res.status(500).json({ error: 'NOVA text chat is not configured. Add a GROQ_API_KEY_1/2/3 to Vercel.' });
   }
 
   const finalMessages = [
@@ -298,14 +257,10 @@ export default async function handler(req, res) {
 
   for (let i = 0; i < groqKeys.length; i++) {
     const apiKey = groqKeys[i];
-
     try {
       const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${apiKey}`
-        },
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
         body: JSON.stringify({
           model: textModel,
           messages: finalMessages,
@@ -324,23 +279,14 @@ export default async function handler(req, res) {
       if (response.ok) {
         const answer = data?.choices?.[0]?.message?.content;
         if (typeof answer === 'string' && answer.trim()) {
-          return res.status(200).json({
-            message: answer,
-            model: textModel,
-            provider: 'Groq',
-            keySlot: i + 1,
-            vision: false,
-            route: 'text-gpt-oss'
-          });
+          return res.status(200).json({ message: answer, model: textModel, provider: 'Groq', keySlot: i + 1, vision: false, route: 'text-gpt-oss' });
         }
-
         lastGroqError = `Groq key ${i + 1} returned no message content.`;
         continue;
       }
 
       const detail = data?.error?.message || data?.message || raw || `HTTP ${response.status}`;
       lastGroqError = `Groq key ${i + 1}: HTTP ${response.status} — ${detail}`;
-
       if (![401, 403, 429].includes(response.status)) break;
     } catch (error) {
       lastGroqError = `Groq key ${i + 1}: ${error?.message || 'Network error'}`;
