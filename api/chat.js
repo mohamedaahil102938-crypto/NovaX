@@ -8,11 +8,7 @@ export default async function handler(req, res) {
   ].filter(Boolean);
 
   const answerModel = 'openai/gpt-oss-120b';
-  const visionModels = [
-    'qwen/qwen3.8-27b',
-    'qwen/qwen3.6-27b',
-    'meta-llama/llama-4-scout-17b-16e-instruct'
-  ];
+  const visionModels = ['qwen/qwen3.8-27b', 'qwen/qwen3.6-27b'];
 
   if (!apiKeys.length) return res.status(500).json({ error: 'No Groq API keys are configured.' });
 
@@ -25,7 +21,6 @@ export default async function handler(req, res) {
   const incomingMessages = Array.isArray(body.messages) ? body.messages : [];
   const workspace = typeof body.workspace === 'string' ? body.workspace : 'Core';
   const context = typeof body.context === 'string' ? body.context.slice(0, 60000) : '';
-
   if (!incomingMessages.length) return res.status(400).json({ error: 'Messages are required.' });
 
   const messages = incomingMessages.filter(m => {
@@ -41,7 +36,7 @@ export default async function handler(req, res) {
     if (!Array.isArray(m.content)) continue;
     for (const part of m.content) {
       const url = part?.image_url?.url;
-      if (part?.type === 'image_url' && typeof url === 'string' && url.startsWith('data:image/')) {
+      if (part?.type === 'image_url' && typeof url === 'string' && /^data:image\/(jpeg|jpg|png|webp);base64,/i.test(url)) {
         imageParts.push({ type: 'image_url', image_url: { url } });
       }
     }
@@ -52,10 +47,8 @@ export default async function handler(req, res) {
 
   for (let i = 0; i < apiKeys.length; i++) {
     const apiKey = apiKeys[i];
-
     try {
       let finalMessages;
-      let visionModelUsed = null;
 
       if (hasImage) {
         const latestUser = [...messages].reverse().find(m => m.role === 'user');
@@ -64,6 +57,8 @@ export default async function handler(req, res) {
           : String(latestUser?.content || '').trim();
 
         let visualDescription = '';
+        let visionModelUsed = '';
+        const visionErrors = [];
 
         for (const visionModel of visionModels) {
           try {
@@ -80,7 +75,7 @@ export default async function handler(req, res) {
                   content: [
                     {
                       type: 'text',
-                      text: `Analyze the attached image for NOVA. User request: ${userText || 'Describe the image.'}\n\nGive a factual, detailed description of what is actually visible, including objects, people, text, numbers, colors, positions, actions, and important relationships. Do not invent details. Clearly mark anything unreadable or uncertain.`
+                      text: `Analyze this attached photo for NOVA. User request: ${userText || 'Describe the image.'}\nReturn only a detailed factual visual analysis. Identify objects, people, actions, scene, colors, positions, and visible text. Do not invent details.`
                     },
                     imageParts[imageParts.length - 1]
                   ]
@@ -88,6 +83,7 @@ export default async function handler(req, res) {
                 temperature: 0.6,
                 max_completion_tokens: 2048,
                 top_p: 0.95,
+                reasoning_effort: 'default',
                 stream: false
               })
             });
@@ -103,35 +99,35 @@ export default async function handler(req, res) {
                 visionModelUsed = visionModel;
                 break;
               }
-              lastError = `Groq vision ${visionModel} key ${i + 1}: empty response.`;
+              visionErrors.push(`${visionModel}: no analysis returned`);
             } else {
               const detail = visionData?.error?.message || visionRaw || `HTTP ${visionResponse.status}`;
-              lastError = `Groq vision ${visionModel} key ${i + 1}: HTTP ${visionResponse.status} — ${detail}`;
+              visionErrors.push(`${visionModel}: HTTP ${visionResponse.status} — ${detail}`);
             }
-          } catch (e) {
-            lastError = `Groq vision ${visionModel} key ${i + 1}: ${e?.message || 'Network error'}`;
+          } catch (visionError) {
+            visionErrors.push(`${visionModel}: ${visionError?.message || 'Network error'}`);
           }
         }
 
-        if (!visualDescription) continue;
+        if (!visualDescription) {
+          lastError = `Qwen vision key ${i + 1} failed: ${visionErrors.join(' | ')}`;
+          continue;
+        }
 
         const cleanedMessages = messages.map(m => {
           if (!Array.isArray(m.content)) return m;
           const textOnly = m.content.filter(p => p?.type === 'text').map(p => p.text || '').join(' ').trim();
-          return {
-            role: m.role,
-            content: textOnly || (m.role === 'user' ? 'The user attached a photo.' : '')
-          };
+          return { role: m.role, content: textOnly || (m.role === 'user' ? 'The user attached a photo.' : '') };
         }).filter(m => m.content || m.role !== 'user');
 
         finalMessages = [
           {
             role: 'system',
-            content: `You are NOVA — Your AI Workspace. Answer the user's request directly and clearly. Current workspace: ${workspace}.${context ? `\n\nDocument context:\n${context}` : ''}`
+            content: `You are NOVA — Your AI Workspace. Answer directly, clearly, and helpfully. Current workspace: ${workspace}.${context ? `\n\nDocument context:\n${context}` : ''}`
           },
           {
             role: 'system',
-            content: `VISUAL EVIDENCE FROM THE USER'S PHOTO (analyzed by ${visionModelUsed}):\n${visualDescription}\n\nUse this as the factual evidence for the attached photo. Answer from it. Do not claim the photo is missing or inaccessible. Do not invent details beyond the evidence.`
+            content: `PHOTO UNDERSTANDING — ${visionModelUsed}:\n${visualDescription}\n\nUse this as the factual visual evidence for the attached photo. Answer the user's request from this evidence. Do not claim the photo is missing or inaccessible, and do not invent unsupported details.`
           },
           ...cleanedMessages
         ];
@@ -175,7 +171,7 @@ export default async function handler(req, res) {
             provider: 'Groq',
             keySlot: i + 1,
             vision: hasImage,
-            visionModel: visionModelUsed
+            visionModel: hasImage ? visionModelUsed : null
           });
         }
         lastError = `Groq key ${i + 1} returned no message content.`;
@@ -191,9 +187,7 @@ export default async function handler(req, res) {
   }
 
   return res.status(502).json({
-    error: hasImage
-      ? `NOVA photo vision failed: ${lastError || 'all Groq vision attempts failed.'}`
-      : `NOVA could not get a response from Groq: ${lastError || 'all configured keys failed.'}`,
+    error: hasImage ? 'NOVA photo vision failed with the Qwen vision models.' : 'NOVA could not get a response from Groq.',
     details: lastError || 'All configured Groq keys failed.',
     provider: 'Groq',
     model: answerModel,
