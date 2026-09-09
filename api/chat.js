@@ -14,9 +14,7 @@ export default async function handler(req, res) {
     'meta-llama/llama-4-scout-17b-16e-instruct'
   ];
 
-  if (!apiKeys.length) {
-    return res.status(500).json({ error: 'No Groq API keys are configured.' });
-  }
+  if (!apiKeys.length) return res.status(500).json({ error: 'No Groq API keys are configured.' });
 
   let body = req.body || {};
   if (typeof body === 'string') {
@@ -28,9 +26,7 @@ export default async function handler(req, res) {
   const workspace = typeof body.workspace === 'string' ? body.workspace : 'Core';
   const context = typeof body.context === 'string' ? body.context.slice(0, 60000) : '';
 
-  if (!incomingMessages.length) {
-    return res.status(400).json({ error: 'Messages are required.' });
-  }
+  if (!incomingMessages.length) return res.status(400).json({ error: 'Messages are required.' });
 
   const messages = incomingMessages.filter(m => {
     if (!m || typeof m !== 'object') return false;
@@ -38,19 +34,15 @@ export default async function handler(req, res) {
     return typeof m.content === 'string' || Array.isArray(m.content);
   }).slice(-30);
 
-  if (!messages.length) {
-    return res.status(400).json({ error: 'No valid chat messages were provided.' });
-  }
+  if (!messages.length) return res.status(400).json({ error: 'No valid chat messages were provided.' });
 
   const imageParts = [];
   for (const m of messages) {
     if (!Array.isArray(m.content)) continue;
     for (const part of m.content) {
-      if (part?.type === 'image_url' && typeof part.image_url?.url === 'string' && part.image_url.url.startsWith('data:image/')) {
-        imageParts.push({
-          type: 'image_url',
-          image_url: { url: part.image_url.url }
-        });
+      const url = part?.image_url?.url;
+      if (part?.type === 'image_url' && typeof url === 'string' && url.startsWith('data:image/')) {
+        imageParts.push({ type: 'image_url', image_url: { url } });
       }
     }
   }
@@ -63,22 +55,16 @@ export default async function handler(req, res) {
 
     try {
       let finalMessages;
+      let visionModelUsed = null;
 
       if (hasImage) {
         const latestUser = [...messages].reverse().find(m => m.role === 'user');
         const userText = Array.isArray(latestUser?.content)
-          ? latestUser.content
-              .filter(p => p?.type === 'text')
-              .map(p => p.text || '')
-              .join(' ')
-              .trim()
+          ? latestUser.content.filter(p => p?.type === 'text').map(p => p.text || '').join(' ').trim()
           : String(latestUser?.content || '').trim();
 
         let visualDescription = '';
-        let visionModelUsed = '';
-        let visionSucceeded = false;
 
-        // Try Qwen 3.8 first, then Qwen 3.6, then Scout as a final fallback.
         for (const visionModel of visionModels) {
           try {
             const visionResponse = await fetch('https://api.groq.com/openai/v1/chat/completions', {
@@ -94,15 +80,14 @@ export default async function handler(req, res) {
                   content: [
                     {
                       type: 'text',
-                      text: `You are the image-understanding stage for NOVA. Analyze the attached photo itself. The user's request is: ${userText || 'Describe what is visible.'}\n\nReturn a detailed factual visual analysis for a second AI. Include every relevant visible detail: objects, people, clothing, actions, scene, colors, positions, visible text, numbers, signs, UI elements, and relationships between objects. Read visible text carefully when possible. Do not invent details. Mark anything unclear as uncertain.`
+                      text: `Analyze the attached image for NOVA. User request: ${userText || 'Describe the image.'}\n\nGive a factual, detailed description of what is actually visible, including objects, people, text, numbers, colors, positions, actions, and important relationships. Do not invent details. Clearly mark anything unreadable or uncertain.`
                     },
-                    ...imageParts.slice(-1)
+                    imageParts[imageParts.length - 1]
                   ]
                 }],
-                temperature: 0.1,
-                max_completion_tokens: 3000,
+                temperature: 0.6,
+                max_completion_tokens: 2048,
                 top_p: 0.95,
-                reasoning_effort: 'default',
                 stream: false
               })
             });
@@ -116,30 +101,23 @@ export default async function handler(req, res) {
               if (typeof candidate === 'string' && candidate.trim()) {
                 visualDescription = candidate.trim();
                 visionModelUsed = visionModel;
-                visionSucceeded = true;
                 break;
               }
-              lastError = `Groq vision (${visionModel}) key ${i + 1} returned no analysis.`;
+              lastError = `Groq vision ${visionModel} key ${i + 1}: empty response.`;
             } else {
               const detail = visionData?.error?.message || visionRaw || `HTTP ${visionResponse.status}`;
-              lastError = `Groq vision (${visionModel}) key ${i + 1}: HTTP ${visionResponse.status} — ${detail}`;
+              lastError = `Groq vision ${visionModel} key ${i + 1}: HTTP ${visionResponse.status} — ${detail}`;
             }
-          } catch (visionError) {
-            lastError = `Groq vision (${visionModel}) key ${i + 1}: ${visionError?.message || 'Network error'}`;
+          } catch (e) {
+            lastError = `Groq vision ${visionModel} key ${i + 1}: ${e?.message || 'Network error'}`;
           }
         }
 
-        if (!visionSucceeded) {
-          continue;
-        }
+        if (!visualDescription) continue;
 
         const cleanedMessages = messages.map(m => {
           if (!Array.isArray(m.content)) return m;
-          const textOnly = m.content
-            .filter(p => p?.type === 'text')
-            .map(p => p.text || '')
-            .join(' ')
-            .trim();
+          const textOnly = m.content.filter(p => p?.type === 'text').map(p => p.text || '').join(' ').trim();
           return {
             role: m.role,
             content: textOnly || (m.role === 'user' ? 'The user attached a photo.' : '')
@@ -149,11 +127,11 @@ export default async function handler(req, res) {
         finalMessages = [
           {
             role: 'system',
-            content: `You are NOVA — Your AI Workspace. Answer directly, clearly, and helpfully. Current workspace: ${workspace}.${context ? `\n\nDocument context:\n${context}` : ''}`
+            content: `You are NOVA — Your AI Workspace. Answer the user's request directly and clearly. Current workspace: ${workspace}.${context ? `\n\nDocument context:\n${context}` : ''}`
           },
           {
             role: 'system',
-            content: `PHOTO UNDERSTANDING FOR THE USER'S ATTACHMENT (analyzed by ${visionModelUsed}):\n${visualDescription}\n\nThis is the visual evidence produced from the photo. Use it to answer the user's request. Do not claim the photo is missing or inaccessible. Do not say you cannot see the image. Do not invent details beyond this evidence.`
+            content: `VISUAL EVIDENCE FROM THE USER'S PHOTO (analyzed by ${visionModelUsed}):\n${visualDescription}\n\nUse this as the factual evidence for the attached photo. Answer from it. Do not claim the photo is missing or inaccessible. Do not invent details beyond the evidence.`
           },
           ...cleanedMessages
         ];
@@ -197,7 +175,7 @@ export default async function handler(req, res) {
             provider: 'Groq',
             keySlot: i + 1,
             vision: hasImage,
-            visionModel: hasImage ? visionModelUsed : null
+            visionModel: visionModelUsed
           });
         }
         lastError = `Groq key ${i + 1} returned no message content.`;
@@ -214,8 +192,8 @@ export default async function handler(req, res) {
 
   return res.status(502).json({
     error: hasImage
-      ? 'NOVA could not process the attached photo with Groq.'
-      : 'NOVA could not get a response from Groq.',
+      ? `NOVA photo vision failed: ${lastError || 'all Groq vision attempts failed.'}`
+      : `NOVA could not get a response from Groq: ${lastError || 'all configured keys failed.'}`,
     details: lastError || 'All configured Groq keys failed.',
     provider: 'Groq',
     model: answerModel,
