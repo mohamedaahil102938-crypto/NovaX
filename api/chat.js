@@ -3,15 +3,14 @@ export default async function handler(req, res) {
     return res.status(405).json({ error: 'Method not allowed' });
   }
 
-  // Groq only. The frontend/UI is intentionally untouched visually.
+  // Groq only — all AI chat/vision requests use GPT-OSS-120B.
   const apiKeys = [
     process.env.GROQ_API_KEY_1?.trim(),
     process.env.GROQ_API_KEY_2?.trim(),
     process.env.GROQ_API_KEY_3?.trim()
   ].filter(Boolean);
 
-  const textModel = 'openai/gpt-oss-120b';
-  const visionModel = 'meta-llama/llama-4-scout-17b-16e-instruct';
+  const model = 'openai/gpt-oss-120b';
 
   if (!apiKeys.length) {
     return res.status(500).json({
@@ -21,7 +20,6 @@ export default async function handler(req, res) {
   }
 
   let body = req.body || {};
-
   if (typeof body === 'string') {
     try {
       body = JSON.parse(body);
@@ -43,11 +41,14 @@ export default async function handler(req, res) {
     message.content.some((part) => part?.type === 'image_url' && part?.image_url?.url)
   );
 
-  const model = hasImage ? visionModel : textModel;
-
   const systemMessage = {
     role: 'system',
-    content: `You are NOVA — Your AI Workspace. Answer the user's actual question directly, clearly and helpfully. You can help with school, science, math, technology, coding, writing, planning, brainstorming, documents, images and everyday questions. Current workspace: ${workspace}. Never pretend a tool or integration exists when it is not connected.\n\nWhen an image is attached, actually inspect it and describe or analyze what you can see. Follow the user's requested photo transformation instructions as a prompt/plan, but do not claim that you rendered a new image unless a real image-generation tool is connected. When documents are supplied as extracted text, use that text as the source and say when something is not present in the supplied document.${context ? `\n\nUser supplied document/file context:\n${context}` : ''}`
+    content: `You are NOVA — Your AI Workspace. Answer the user's actual question directly, clearly and helpfully. You can help with school, science, math, technology, coding, writing, planning, brainstorming, documents, images and everyday questions. Current workspace: ${workspace}. Never pretend a tool or integration exists when it is not connected.
+
+When an image is attached, use the image input to analyze what is visible and answer the user's question about it. If the user asks to transform or edit the image, describe the requested transformation accurately, but do not claim that a new image was rendered unless a real image-generation tool is connected. When documents are supplied as extracted text, use that text as the source and say when something is not present in the supplied document.${context ? `
+
+User supplied document/file context:
+${context}` : ''}`
   };
 
   const messages = incomingMessages
@@ -64,7 +65,7 @@ export default async function handler(req, res) {
 
   let lastError = null;
 
-  // Try each configured key in order. A rate-limit/auth failure moves to the next key.
+  // Rotate through the three Groq keys. A rate-limit/auth failure moves to the next key.
   for (let i = 0; i < apiKeys.length; i++) {
     const apiKey = apiKeys[i];
 
@@ -79,16 +80,15 @@ export default async function handler(req, res) {
           model,
           messages: [systemMessage, ...messages],
           temperature: 1,
-          max_completion_tokens: hasImage ? 2048 : 2048,
+          max_completion_tokens: 2048,
           top_p: 1,
-          ...(hasImage ? {} : { reasoning_effort: 'medium' }),
+          reasoning_effort: 'medium',
           stream: false
         })
       });
 
       const raw = await response.text();
       let data = {};
-
       try {
         data = raw ? JSON.parse(raw) : {};
       } catch {
@@ -97,7 +97,6 @@ export default async function handler(req, res) {
 
       if (response.ok) {
         const answer = data?.choices?.[0]?.message?.content;
-
         if (typeof answer === 'string' && answer.trim()) {
           return res.status(200).json({
             message: answer,
@@ -107,7 +106,6 @@ export default async function handler(req, res) {
             vision: hasImage
           });
         }
-
         lastError = `Groq key ${i + 1} returned no message content.`;
         continue;
       }
@@ -120,12 +118,13 @@ export default async function handler(req, res) {
       }
     } catch (error) {
       lastError = `Groq key ${i + 1}: ${error?.message || 'Network error'}`;
-      continue;
     }
   }
 
   return res.status(502).json({
-    error: hasImage ? 'NOVA could not analyze the image with Groq.' : 'NOVA could not get a response from Groq.',
+    error: hasImage
+      ? 'NOVA could not analyze the image with Groq GPT-OSS-120B.'
+      : 'NOVA could not get a response from Groq GPT-OSS-120B.',
     details: lastError || 'All configured Groq keys failed.',
     provider: 'Groq',
     model,
