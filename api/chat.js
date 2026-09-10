@@ -11,7 +11,11 @@ export default async function handler(req, res) {
   const HF_FAL = `${HF_ROUTER}/fal-ai`;
   const HF_INFERENCE = `${HF_ROUTER}/hf-inference/models`;
   const TEXT_IMAGE_MODEL = 'Tongyi-MAI/Z-Image-Turbo';
-  const QUALITY_IMAGE_MODEL = 'black-forest-labs/FLUX.1-dev';
+  const QUALITY_IMAGE_MODELS = [
+    'Qwen/Qwen-Image',
+    'inclusionAI/LLaDA-Image-Turbo',
+    'inclusionAI/LLaDA-Image'
+  ];
   const FLUX_EDIT_PATH = 'fal-ai/flux-2/edit';
   const QWEN_EDIT_PATH = 'fal-ai/qwen-image-edit-2509';
 
@@ -152,29 +156,33 @@ export default async function handler(req, res) {
     ].filter(Boolean).join('\n\n');
 
     if (generationMode === 'quality') {
-      try {
-        const image = await hfInferenceImage(QUALITY_IMAGE_MODEL, prompt);
-        return res.status(200).json({
-          message: 'Here is your high-quality image.',
-          image,
-          model: QUALITY_IMAGE_MODEL,
-          provider: 'Hugging Face / hf-inference',
-          vision: false,
-          route: 'text-to-image-quality-hf-inference',
-          generationMode: 'quality',
-          paidFallback: false
-        });
-      } catch (error) {
-        return res.status(502).json({
-          error: `NOVA could not generate the high-quality image with Hugging Face. No paid fallback was used.\n\nREAL ERROR: ${error?.message || 'Network error'}`,
-          details: error?.message || 'Network error',
-          provider: 'Hugging Face / hf-inference',
-          model: QUALITY_IMAGE_MODEL,
-          route: 'text-to-image-quality-hf-inference',
-          generationMode: 'quality',
-          paidFallback: false
-        });
+      const failures = [];
+      for (const model of QUALITY_IMAGE_MODELS) {
+        try {
+          const image = await hfInferenceImage(model, prompt);
+          return res.status(200).json({
+            message: 'Here is your high-quality image.',
+            image,
+            model,
+            provider: 'Hugging Face / hf-inference',
+            vision: false,
+            route: 'text-to-image-quality-hf-inference',
+            generationMode: 'quality',
+            paidFallback: false
+          });
+        } catch (error) {
+          failures.push(`${model}: ${error?.message || 'Inference failed.'}`);
+        }
       }
+      return res.status(502).json({
+        error: `NOVA could not generate the high-quality image with the available Hugging Face models. No paid fallback was used.\n\nTRIED ${QUALITY_IMAGE_MODELS.length} FREE-FIRST HF MODELS:\n${failures.join('\n')}`,
+        details: failures.join('\n'),
+        provider: 'Hugging Face / hf-inference',
+        modelsTried: QUALITY_IMAGE_MODELS,
+        route: 'text-to-image-quality-hf-inference',
+        generationMode: 'quality',
+        paidFallback: false
+      });
     }
 
     try {
