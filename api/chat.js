@@ -10,6 +10,8 @@ export default async function handler(req, res) {
   const HF_ROUTER = 'https://router.huggingface.co';
   const HF_FAL = `${HF_ROUTER}/fal-ai`;
   const TEXT_IMAGE_MODEL = 'Tongyi-MAI/Z-Image-Turbo';
+  const QUALITY_IMAGE_MODEL = 'black-forest-labs/FLUX.2-dev';
+  const QUALITY_IMAGE_PATH = 'fal-ai/flux-2';
   const FLUX_EDIT_PATH = 'fal-ai/flux-2/edit';
   const QWEN_EDIT_PATH = 'fal-ai/qwen-image-edit-2509';
 
@@ -53,7 +55,7 @@ export default async function handler(req, res) {
     const statusUrl = `${baseUrl}${modelPath}/status${query}`;
     const resultUrl = `${baseUrl}${modelPath}${query}`;
 
-    for (let i = 0; i < 20; i++) {
+    for (let i = 0; i < 40; i++) {
       await sleep(500);
       const statusResponse = await fetch(statusUrl, { headers });
       const statusRaw = await statusResponse.arrayBuffer();
@@ -73,7 +75,7 @@ export default async function handler(req, res) {
       if (!imageUrl) throw new Error(`Fal.ai completed without an image URL: ${JSON.stringify(result).slice(0, 1200)}`);
       return await imageUrlToPayload(imageUrl);
     }
-    throw new Error('Fal.ai image job timed out after 10 seconds.');
+    throw new Error('Fal.ai image job timed out after 20 seconds.');
   }
 
   if (!groqKeys.length && !geminiKey && !hfToken) return res.status(500).json({ error: 'No AI API keys are configured.' });
@@ -86,6 +88,7 @@ export default async function handler(req, res) {
   const incomingMessages = Array.isArray(body.messages) ? body.messages : [];
   const workspace = typeof body.workspace === 'string' ? body.workspace : 'Core';
   const context = typeof body.context === 'string' ? body.context.slice(0, 60000) : '';
+  const generationMode = body.generationMode === 'quality' ? 'quality' : 'fast';
   if (!incomingMessages.length) return res.status(400).json({ error: 'Messages are required.' });
 
   const messages = incomingMessages.filter(m => m && typeof m === 'object' && ['user', 'assistant', 'system'].includes(m.role) && (typeof m.content === 'string' || Array.isArray(m.content))).slice(-30);
@@ -112,10 +115,20 @@ export default async function handler(req, res) {
   const imageGenerationRequest = !hasImage && (/(create|generate|make|draw|render|design|produce)[\s\S]{0,80}(image|picture|photo|art|illustration|wallpaper|poster|logo|portrait)/i.test(userText) || /(image|picture|photo|art|illustration|wallpaper|poster)[\s\S]{0,40}(generate|create|make|draw|render)/i.test(userText));
   const imageToImageRequest = hasImage && /(edit|change|modify|transform|restyle|redesign|remove|replace|add|turn|convert|make|generate|create|draw|render)/i.test(userText) && /(image|photo|picture|it|this|that|background|person|object|style|color|clothes|face)/i.test(userText);
 
-  // IMAGE GENERATION: current Hugging Face Inference Provider (fal-ai), no old hf-inference fallback.
+  // IMAGE GENERATION: user-selected fast or quality route via Hugging Face Inference Providers.
   if (imageGenerationRequest) {
     if (!hfToken) return res.status(500).json({ error: 'NOVA image generation is not configured. Add HF_TOKEN to Vercel.' });
-    const prompt = ['Create the requested image.', 'Generate the visual itself, not a description of it.', 'Follow the user request closely and produce a polished result.', `User request: ${userText || 'Create an image.'}`, context ? `Relevant context:\n${context}` : ''].filter(Boolean).join('\n\n');
+    const prompt = ['Create the requested image.', 'Generate the visual itself, not a description of it.', 'Follow the user request closely and produce a polished result.', generationMode === 'quality' ? 'Prioritize detail, composition, lighting, realism, and prompt fidelity over speed.' : 'Prioritize speed while keeping the image clean and polished.', `User request: ${userText || 'Create an image.'}`, context ? `Relevant context:\n${context}` : ''].filter(Boolean).join('\n\n');
+
+    if (generationMode === 'quality') {
+      try {
+        const image = await falQueueImage(QUALITY_IMAGE_PATH, { prompt, image_size: { width: 1024, height: 1024 }, num_images: 1, output_format: 'png' });
+        return res.status(200).json({ message: 'Here is your high-quality image.', image, model: QUALITY_IMAGE_MODEL, provider: 'Hugging Face / fal-ai', vision: false, route: 'text-to-image-quality-fal-ai', generationMode: 'quality' });
+      } catch (error) {
+        return res.status(502).json({ error: `NOVA could not generate the high-quality image with Hugging Face.\n\nREAL ERROR: ${error?.message || 'Network error'}`, details: error?.message || 'Network error', provider: 'Hugging Face / fal-ai', model: QUALITY_IMAGE_MODEL, route: 'text-to-image-quality-fal-ai', generationMode: 'quality' });
+      }
+    }
+
     try {
       const response = await fetch(`${HF_FAL}/fal-ai/z-image/turbo`, {
         method: 'POST',
@@ -123,14 +136,14 @@ export default async function handler(req, res) {
         body: JSON.stringify({ prompt, image_size: { width: 1024, height: 1024 }, num_inference_steps: 8, enable_safety_checker: true, output_format: 'png' })
       });
       const raw = await response.arrayBuffer();
-      if (!response.ok) return res.status(502).json({ error: `NOVA could not generate the image with Hugging Face.\n\nREAL ERROR: Z-Image-Turbo via fal-ai: HTTP ${response.status} — ${await readError(response, raw)}`, provider: 'Hugging Face', model: TEXT_IMAGE_MODEL, route: 'text-to-image-fal-ai' });
+      if (!response.ok) return res.status(502).json({ error: `NOVA could not generate the image with Hugging Face.\n\nREAL ERROR: Z-Image-Turbo via fal-ai: HTTP ${response.status} — ${await readError(response, raw)}`, provider: 'Hugging Face', model: TEXT_IMAGE_MODEL, route: 'text-to-image-fast-fal-ai', generationMode: 'fast' });
       let data = {};
       try { data = JSON.parse(new TextDecoder().decode(raw)); } catch { return res.status(502).json({ error: 'Hugging Face fal-ai returned invalid JSON for Z-Image-Turbo.', provider: 'Hugging Face', model: TEXT_IMAGE_MODEL }); }
       const imageUrl = data?.images?.[0]?.url;
       if (!imageUrl) return res.status(502).json({ error: `Z-Image-Turbo completed without an image URL: ${JSON.stringify(data).slice(0, 1200)}`, provider: 'Hugging Face', model: TEXT_IMAGE_MODEL });
-      return res.status(200).json({ message: 'Here is your image.', image: await imageUrlToPayload(imageUrl), model: TEXT_IMAGE_MODEL, provider: 'Hugging Face / fal-ai', vision: false, route: 'text-to-image-fal-ai' });
+      return res.status(200).json({ message: 'Here is your fast image.', image: await imageUrlToPayload(imageUrl), model: TEXT_IMAGE_MODEL, provider: 'Hugging Face / fal-ai', vision: false, route: 'text-to-image-fast-fal-ai', generationMode: 'fast' });
     } catch (error) {
-      return res.status(502).json({ error: `NOVA could not generate the image with Hugging Face.\n\nREAL ERROR: ${error?.message || 'Network error'}`, details: error?.message || 'Network error', provider: 'Hugging Face / fal-ai', model: TEXT_IMAGE_MODEL, route: 'text-to-image-fal-ai' });
+      return res.status(502).json({ error: `NOVA could not generate the image with Hugging Face.\n\nREAL ERROR: ${error?.message || 'Network error'}`, details: error?.message || 'Network error', provider: 'Hugging Face / fal-ai', model: TEXT_IMAGE_MODEL, route: 'text-to-image-fast-fal-ai', generationMode: 'fast' });
     }
   }
 
