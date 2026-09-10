@@ -9,9 +9,9 @@ export default async function handler(req, res) {
 
   const HF_ROUTER = 'https://router.huggingface.co';
   const HF_FAL = `${HF_ROUTER}/fal-ai`;
-  const HF_INFERENCE = `${HF_ROUTER}/hf-inference/models`;
   const TEXT_IMAGE_MODEL = 'Tongyi-MAI/Z-Image-Turbo';
   const QUALITY_IMAGE_MODEL = 'krea/Krea-2-Turbo';
+  const QUALITY_IMAGE_PATH = 'krea-2';
   const FLUX_EDIT_PATH = 'fal-ai/flux-2/edit';
   const QWEN_EDIT_PATH = 'fal-ai/qwen-image-edit-2509';
 
@@ -36,38 +36,17 @@ export default async function handler(req, res) {
     return { mimeType, data: Buffer.from(raw).toString('base64') };
   }
 
-  async function hfInferenceImage(model, prompt) {
-    const url = `${HF_INFERENCE}/${model}`;
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${hfToken}`, 'Content-Type': 'application/json', Accept: 'image/png, image/jpeg, application/json' },
-      body: JSON.stringify({ inputs: prompt })
-    });
-    const raw = await response.arrayBuffer();
-    if (!response.ok) throw new Error(`Hugging Face hf-inference: HTTP ${response.status} — ${await readError(response, raw)}`);
-    const contentType = (response.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
-    if (contentType.startsWith('image/')) {
-      return { mimeType: contentType, data: Buffer.from(raw).toString('base64') };
-    }
-    let data = {};
-    try { data = JSON.parse(new TextDecoder().decode(raw)); } catch { throw new Error(`Hugging Face returned ${contentType || 'non-image data'} instead of an image.`); }
-    if (data?.error) throw new Error(typeof data.error === 'string' ? data.error : JSON.stringify(data.error));
-    const imageUrl = data?.images?.[0]?.url || data?.image?.url;
-    if (imageUrl) return await imageUrlToPayload(imageUrl);
-    throw new Error(`Hugging Face completed without an image: ${JSON.stringify(data).slice(0, 1200)}`);
-  }
-
   async function falQueueImage(path, body) {
     const submitUrl = `${HF_FAL}/${path}?_subdomain=queue`;
     const headers = { Authorization: `Bearer ${hfToken}`, 'Content-Type': 'application/json' };
     const submit = await fetch(submitUrl, { method: 'POST', headers, body: JSON.stringify(body) });
     const raw = await submit.arrayBuffer();
-    if (!submit.ok) throw new Error(`Fal.ai queue submit: HTTP ${submit.status} — ${await readError(submit, raw)}`);
+    if (!submit.ok) throw new Error(`Hugging Face fal-ai queue submit: HTTP ${submit.status} — ${await readError(submit, raw)}`);
 
     let queued = {};
-    try { queued = JSON.parse(new TextDecoder().decode(raw)); } catch { throw new Error('Fal.ai queue returned invalid JSON.'); }
+    try { queued = JSON.parse(new TextDecoder().decode(raw)); } catch { throw new Error('Hugging Face fal-ai queue returned invalid JSON.'); }
     if (queued?.images?.[0]?.url) return await imageUrlToPayload(queued.images[0].url);
-    if (!queued?.request_id || !queued?.response_url) throw new Error(`Fal.ai queue returned no request_id/response_url: ${JSON.stringify(queued).slice(0, 1200)}`);
+    if (!queued?.request_id || !queued?.response_url) throw new Error(`Hugging Face fal-ai queue returned no request_id/response_url: ${JSON.stringify(queued).slice(0, 1200)}`);
 
     const responseUrl = new URL(queued.response_url);
     const modelPath = responseUrl.pathname;
@@ -80,23 +59,23 @@ export default async function handler(req, res) {
       await sleep(500);
       const statusResponse = await fetch(statusUrl, { headers });
       const statusRaw = await statusResponse.arrayBuffer();
-      if (!statusResponse.ok) throw new Error(`Fal.ai queue status: HTTP ${statusResponse.status} — ${await readError(statusResponse, statusRaw)}`);
+      if (!statusResponse.ok) throw new Error(`Hugging Face fal-ai queue status: HTTP ${statusResponse.status} — ${await readError(statusResponse, statusRaw)}`);
       let statusData = {};
-      try { statusData = JSON.parse(new TextDecoder().decode(statusRaw)); } catch { throw new Error('Fal.ai status returned invalid JSON.'); }
+      try { statusData = JSON.parse(new TextDecoder().decode(statusRaw)); } catch { throw new Error('Hugging Face fal-ai status returned invalid JSON.'); }
       const status = statusData?.status;
-      if (status === 'FAILED') throw new Error(`Fal.ai job failed: ${statusData?.error || JSON.stringify(statusData).slice(0, 1200)}`);
+      if (status === 'FAILED') throw new Error(`Hugging Face fal-ai job failed: ${statusData?.error || JSON.stringify(statusData).slice(0, 1200)}`);
       if (status !== 'COMPLETED') continue;
 
       const resultResponse = await fetch(resultUrl, { headers });
       const resultRaw = await resultResponse.arrayBuffer();
-      if (!resultResponse.ok) throw new Error(`Fal.ai queue result: HTTP ${resultResponse.status} — ${await readError(resultResponse, resultRaw)}`);
+      if (!resultResponse.ok) throw new Error(`Hugging Face fal-ai queue result: HTTP ${resultResponse.status} — ${await readError(resultResponse, resultRaw)}`);
       let result = {};
-      try { result = JSON.parse(new TextDecoder().decode(resultRaw)); } catch { throw new Error('Fal.ai result returned invalid JSON.'); }
+      try { result = JSON.parse(new TextDecoder().decode(resultRaw)); } catch { throw new Error('Hugging Face fal-ai result returned invalid JSON.'); }
       const imageUrl = result?.images?.[0]?.url;
-      if (!imageUrl) throw new Error(`Fal.ai completed without an image URL: ${JSON.stringify(result).slice(0, 1200)}`);
+      if (!imageUrl) throw new Error(`Hugging Face fal-ai completed without an image URL: ${JSON.stringify(result).slice(0, 1200)}`);
       return await imageUrlToPayload(imageUrl);
     }
-    throw new Error('Fal.ai image job timed out after 20 seconds.');
+    throw new Error('Hugging Face fal-ai image job timed out after 20 seconds.');
   }
 
   if (!groqKeys.length && !geminiKey && !hfToken) return res.status(500).json({ error: 'No AI API keys are configured.' });
@@ -137,19 +116,19 @@ export default async function handler(req, res) {
   const imageToImageRequest = hasImage && /(edit|change|modify|transform|restyle|redesign|remove|replace|add|turn|convert|make|generate|create|draw|render)/i.test(userText) && /(image|photo|picture|it|this|that|background|person|object|style|color|clothes|face)/i.test(userText);
 
   // IMAGE GENERATION: user-selected Fast or Quality.
-  // Fast uses the existing working Z-Image-Turbo/fal-ai route.
-  // Quality uses ONLY Hugging Face's hf-inference route with Krea-2-Turbo.
-  // There is deliberately NO paid fallback for Quality.
+  // Fast remains the existing working Z-Image-Turbo route.
+  // Quality uses Krea-2 through Hugging Face's fal-ai inference provider route.
+  // There is deliberately NO paid fallback.
   if (imageGenerationRequest) {
     if (!hfToken) return res.status(500).json({ error: 'NOVA image generation is not configured. Add HF_TOKEN to Vercel.' });
     const prompt = ['Create the requested image.', 'Generate the visual itself, not a description of it.', 'Follow the user request closely and produce a polished result.', generationMode === 'quality' ? 'Prioritize detail, composition, lighting, realism, and prompt fidelity over speed.' : 'Prioritize speed while keeping the image clean and polished.', `User request: ${userText || 'Create an image.'}`, context ? `Relevant context:\n${context}` : ''].filter(Boolean).join('\n\n');
 
     if (generationMode === 'quality') {
       try {
-        const image = await hfInferenceImage(QUALITY_IMAGE_MODEL, prompt);
-        return res.status(200).json({ message: 'Here is your high-quality image.', image, model: QUALITY_IMAGE_MODEL, provider: 'Hugging Face / hf-inference', vision: false, route: 'text-to-image-quality-hf-inference', generationMode: 'quality' });
+        const image = await falQueueImage(QUALITY_IMAGE_PATH, { prompt, image_size: { width: 1024, height: 1024 }, num_images: 1, output_format: 'png' });
+        return res.status(200).json({ message: 'Here is your high-quality image.', image, model: QUALITY_IMAGE_MODEL, provider: 'Hugging Face / fal-ai', vision: false, route: 'text-to-image-quality-fal-ai', generationMode: 'quality', paidFallback: false });
       } catch (error) {
-        return res.status(502).json({ error: `NOVA could not generate the high-quality image with Hugging Face. No fallback was used.\n\nREAL ERROR: ${error?.message || 'Network error'}`, details: error?.message || 'Network error', provider: 'Hugging Face / hf-inference', model: QUALITY_IMAGE_MODEL, route: 'text-to-image-quality-hf-inference', generationMode: 'quality', paidFallback: false });
+        return res.status(502).json({ error: `NOVA could not generate the high-quality image with Hugging Face. No paid fallback was used.\n\nREAL ERROR: ${error?.message || 'Network error'}`, details: error?.message || 'Network error', provider: 'Hugging Face / fal-ai', model: QUALITY_IMAGE_MODEL, route: 'text-to-image-quality-fal-ai', generationMode: 'quality', paidFallback: false });
       }
     }
 
@@ -160,14 +139,14 @@ export default async function handler(req, res) {
         body: JSON.stringify({ prompt, image_size: { width: 1024, height: 1024 }, num_inference_steps: 8, enable_safety_checker: true, output_format: 'png' })
       });
       const raw = await response.arrayBuffer();
-      if (!response.ok) return res.status(502).json({ error: `NOVA could not generate the image with Hugging Face.\n\nREAL ERROR: Z-Image-Turbo via fal-ai: HTTP ${response.status} — ${await readError(response, raw)}`, provider: 'Hugging Face', model: TEXT_IMAGE_MODEL, route: 'text-to-image-fast-fal-ai', generationMode: 'fast' });
+      if (!response.ok) return res.status(502).json({ error: `NOVA could not generate the image with Hugging Face.\n\nREAL ERROR: Z-Image-Turbo via fal-ai: HTTP ${response.status} — ${await readError(response, raw)}`, provider: 'Hugging Face', model: TEXT_IMAGE_MODEL, route: 'text-to-image-fast-fal-ai', generationMode: 'fast', paidFallback: false });
       let data = {};
       try { data = JSON.parse(new TextDecoder().decode(raw)); } catch { return res.status(502).json({ error: 'Hugging Face fal-ai returned invalid JSON for Z-Image-Turbo.', provider: 'Hugging Face', model: TEXT_IMAGE_MODEL }); }
       const imageUrl = data?.images?.[0]?.url;
       if (!imageUrl) return res.status(502).json({ error: `Z-Image-Turbo completed without an image URL: ${JSON.stringify(data).slice(0, 1200)}`, provider: 'Hugging Face', model: TEXT_IMAGE_MODEL });
-      return res.status(200).json({ message: 'Here is your fast image.', image: await imageUrlToPayload(imageUrl), model: TEXT_IMAGE_MODEL, provider: 'Hugging Face / fal-ai', vision: false, route: 'text-to-image-fast-fal-ai', generationMode: 'fast' });
+      return res.status(200).json({ message: 'Here is your fast image.', image: await imageUrlToPayload(imageUrl), model: TEXT_IMAGE_MODEL, provider: 'Hugging Face / fal-ai', vision: false, route: 'text-to-image-fast-fal-ai', generationMode: 'fast', paidFallback: false });
     } catch (error) {
-      return res.status(502).json({ error: `NOVA could not generate the image with Hugging Face.\n\nREAL ERROR: ${error?.message || 'Network error'}`, details: error?.message || 'Network error', provider: 'Hugging Face / fal-ai', model: TEXT_IMAGE_MODEL, route: 'text-to-image-fast-fal-ai', generationMode: 'fast' });
+      return res.status(502).json({ error: `NOVA could not generate the image with Hugging Face.\n\nREAL ERROR: ${error?.message || 'Network error'}`, details: error?.message || 'Network error', provider: 'Hugging Face / fal-ai', model: TEXT_IMAGE_MODEL, route: 'text-to-image-fast-fal-ai', generationMode: 'fast', paidFallback: false });
     }
   }
 
@@ -185,12 +164,12 @@ export default async function handler(req, res) {
     for (const model of models) {
       try {
         const image = await falQueueImage(model.path, { prompt: editPrompt, image_urls: [imageDataUrl], num_images: 1, output_format: 'png' });
-        return res.status(200).json({ message: 'Here is the edited image.', image, model: model.name, provider: 'Hugging Face / fal-ai', vision: false, route: 'image-to-image-fal-ai' });
+        return res.status(200).json({ message: 'Here is the edited image.', image, model: model.name, provider: 'Hugging Face / fal-ai', vision: false, route: 'image-to-image-fal-ai', paidFallback: false });
       } catch (error) {
         failures.push(`${model.name}: ${error?.message || 'Inference failed.'}`);
       }
     }
-    return res.status(502).json({ error: `NOVA could not edit the image with the current Hugging Face Inference Providers.\n\nTRIED ${models.length} MODELS:\n${failures.join('\n')}`, details: failures.join('\n'), provider: 'Hugging Face / fal-ai', modelsTried: models.map(m => m.name), route: 'image-to-image-fal-ai' });
+    return res.status(502).json({ error: `NOVA could not edit the image with the current Hugging Face Inference Providers.\n\nTRIED ${models.length} MODELS:\n${failures.join('\n')}`, details: failures.join('\n'), provider: 'Hugging Face / fal-ai', modelsTried: models.map(m => m.name), route: 'image-to-image-fal-ai', paidFallback: false });
   }
 
   // IMAGE VISION: Gemini only, direct Gemini answer. GPT-OSS is bypassed.
