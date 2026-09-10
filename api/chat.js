@@ -9,9 +9,9 @@ export default async function handler(req, res) {
 
   const HF_ROUTER = 'https://router.huggingface.co';
   const HF_FAL = `${HF_ROUTER}/fal-ai`;
+  const HF_INFERENCE = `${HF_ROUTER}/hf-inference/models`;
   const TEXT_IMAGE_MODEL = 'Tongyi-MAI/Z-Image-Turbo';
-  const QUALITY_IMAGE_MODEL = 'krea/Krea-2-Turbo';
-  const QUALITY_IMAGE_PATH = 'krea-2';
+  const QUALITY_IMAGE_MODEL = 'black-forest-labs/FLUX.1-dev';
   const FLUX_EDIT_PATH = 'fal-ai/flux-2/edit';
   const QWEN_EDIT_PATH = 'fal-ai/qwen-image-edit-2509';
 
@@ -34,6 +34,28 @@ export default async function handler(req, res) {
     const mimeType = (response.headers.get('content-type') || 'image/png').split(';')[0].trim();
     if (!mimeType.toLowerCase().startsWith('image/')) throw new Error(`Generated image URL returned ${mimeType}`);
     return { mimeType, data: Buffer.from(raw).toString('base64') };
+  }
+
+  async function hfInferenceImage(model, prompt) {
+    const response = await fetch(`${HF_INFERENCE}/${model}`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${hfToken}`,
+        'Content-Type': 'application/json',
+        Accept: 'image/png, image/jpeg, application/json'
+      },
+      body: JSON.stringify({ inputs: prompt })
+    });
+    const raw = await response.arrayBuffer();
+    if (!response.ok) throw new Error(`Hugging Face hf-inference: HTTP ${response.status} — ${await readError(response, raw)}`);
+    const contentType = (response.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
+    if (contentType.startsWith('image/')) return { mimeType: contentType, data: Buffer.from(raw).toString('base64') };
+    let data = {};
+    try { data = JSON.parse(new TextDecoder().decode(raw)); } catch { throw new Error(`Hugging Face returned ${contentType || 'non-image'} instead of an image.`); }
+    if (data?.error) throw new Error(typeof data.error === 'string' ? data.error : JSON.stringify(data.error));
+    const imageUrl = data?.images?.[0]?.url || data?.image?.url;
+    if (imageUrl) return await imageUrlToPayload(imageUrl);
+    throw new Error(`Hugging Face completed without an image: ${JSON.stringify(data).slice(0, 1200)}`);
   }
 
   async function falQueueImage(path, body) {
@@ -112,23 +134,46 @@ export default async function handler(req, res) {
     ? latestUser.content.filter(p => p?.type === 'text').map(p => p.text || '').join(' ').trim()
     : String(latestUser?.content || '').trim();
 
-  const imageGenerationRequest = !hasImage && (/(create|generate|make|draw|render|design|produce)[\s\S]{0,80}(image|picture|photo|art|illustration|wallpaper|poster|logo|portrait)/i.test(userText) || /(image|picture|photo|art|illustration|wallpaper|poster)[\s\S]{0,40}(generate|create|make|draw|render)/i.test(userText));
-  const imageToImageRequest = hasImage && /(edit|change|modify|transform|restyle|redesign|remove|replace|add|turn|convert|make|generate|create|draw|render)/i.test(userText) && /(image|photo|picture|it|this|that|background|person|object|style|color|clothes|face)/i.test(userText);
+  const imageGenerationRequest = (!hasImage && /\b(create|generate|make|draw|render|design|produce)\b[\s\S]{0,80}\b(image|picture|photo|art|illustration|wallpaper|poster|logo|portrait)\b/i.test(userText)) || (!hasImage && /\b(image|picture|photo|art|illustration|wallpaper|poster)\b[\s\S]{0,40}\b(generate|create|make|draw|render)\b/i.test(userText));
+  const imageToImageRequest = hasImage && /\b(edit|change|modify|transform|restyle|redesign|remove|replace|add|turn|convert|make|generate|create|draw|render)\b/i.test(userText) && /\b(image|photo|picture|it|this|that|background|person|object|style|color|clothes|face)\b/i.test(userText);
 
-  // IMAGE GENERATION: user-selected Fast or Quality.
-  // Fast remains the existing working Z-Image-Turbo route.
-  // Quality uses Krea-2 through Hugging Face's fal-ai inference provider route.
-  // There is deliberately NO paid fallback.
   if (imageGenerationRequest) {
     if (!hfToken) return res.status(500).json({ error: 'NOVA image generation is not configured. Add HF_TOKEN to Vercel.' });
-    const prompt = ['Create the requested image.', 'Generate the visual itself, not a description of it.', 'Follow the user request closely and produce a polished result.', generationMode === 'quality' ? 'Prioritize detail, composition, lighting, realism, and prompt fidelity over speed.' : 'Prioritize speed while keeping the image clean and polished.', `User request: ${userText || 'Create an image.'}`, context ? `Relevant context:\n${context}` : ''].filter(Boolean).join('\n\n');
+
+    const prompt = [
+      'Create the requested image.',
+      'Generate the visual itself, not a description of it.',
+      'Follow the user request closely and produce a polished result.',
+      generationMode === 'quality'
+        ? 'Prioritize maximum detail, realism, texture quality, composition, lighting, sharpness, and prompt fidelity. This is the quality mode, so favor visual quality over speed.'
+        : 'Prioritize speed while keeping the image clean and polished.',
+      `User request: ${userText || 'Create an image.'}`,
+      context ? `Relevant context:\n${context}` : ''
+    ].filter(Boolean).join('\n\n');
 
     if (generationMode === 'quality') {
       try {
-        const image = await falQueueImage(QUALITY_IMAGE_PATH, { prompt, image_size: { width: 1024, height: 1024 }, num_images: 1, output_format: 'png' });
-        return res.status(200).json({ message: 'Here is your high-quality image.', image, model: QUALITY_IMAGE_MODEL, provider: 'Hugging Face / fal-ai', vision: false, route: 'text-to-image-quality-fal-ai', generationMode: 'quality', paidFallback: false });
+        const image = await hfInferenceImage(QUALITY_IMAGE_MODEL, prompt);
+        return res.status(200).json({
+          message: 'Here is your high-quality image.',
+          image,
+          model: QUALITY_IMAGE_MODEL,
+          provider: 'Hugging Face / hf-inference',
+          vision: false,
+          route: 'text-to-image-quality-hf-inference',
+          generationMode: 'quality',
+          paidFallback: false
+        });
       } catch (error) {
-        return res.status(502).json({ error: `NOVA could not generate the high-quality image with Hugging Face. No paid fallback was used.\n\nREAL ERROR: ${error?.message || 'Network error'}`, details: error?.message || 'Network error', provider: 'Hugging Face / fal-ai', model: QUALITY_IMAGE_MODEL, route: 'text-to-image-quality-fal-ai', generationMode: 'quality', paidFallback: false });
+        return res.status(502).json({
+          error: `NOVA could not generate the high-quality image with Hugging Face. No paid fallback was used.\n\nREAL ERROR: ${error?.message || 'Network error'}`,
+          details: error?.message || 'Network error',
+          provider: 'Hugging Face / hf-inference',
+          model: QUALITY_IMAGE_MODEL,
+          route: 'text-to-image-quality-hf-inference',
+          generationMode: 'quality',
+          paidFallback: false
+        });
       }
     }
 
@@ -150,7 +195,6 @@ export default async function handler(req, res) {
     }
   }
 
-  // IMAGE-TO-IMAGE: FLUX.2-dev first, Qwen Image Edit fallback. Both use current fal-ai routing.
   if (imageToImageRequest) {
     if (!hfToken) return res.status(500).json({ error: 'NOVA image-to-image is not configured. Add HF_TOKEN to Vercel.' });
     const lastImage = imageParts[imageParts.length - 1];
@@ -172,7 +216,6 @@ export default async function handler(req, res) {
     return res.status(502).json({ error: `NOVA could not edit the image with the current Hugging Face Inference Providers.\n\nTRIED ${models.length} MODELS:\n${failures.join('\n')}`, details: failures.join('\n'), provider: 'Hugging Face / fal-ai', modelsTried: models.map(m => m.name), route: 'image-to-image-fal-ai', paidFallback: false });
   }
 
-  // IMAGE VISION: Gemini only, direct Gemini answer. GPT-OSS is bypassed.
   if (hasImage) {
     if (!geminiKey) return res.status(500).json({ error: 'NOVA image vision is not configured. Add GEMINI_API_KEY_1 to Vercel.' });
     const historyText = messages.filter(m => m.role !== 'system').slice(-12).map(m => {
@@ -196,7 +239,6 @@ export default async function handler(req, res) {
     return res.status(502).json({ error: `NOVA could not process the image with Gemini.\n\nREAL ERROR: ${lastGeminiError || 'All Gemini vision models failed.'}`, details: lastGeminiError || 'All Gemini vision models failed.', provider: 'Google Gemini', vision: true });
   }
 
-  // TEXT: Groq GPT-OSS-120B only, with the existing three-key rotation.
   if (!groqKeys.length) return res.status(500).json({ error: 'NOVA text chat is not configured. Add a GROQ_API_KEY_1/2/3 to Vercel.' });
   const finalMessages = [{ role: 'system', content: `You are NOVA — Your AI Workspace. Answer the user's actual question directly, clearly and helpfully. Current workspace: ${workspace}.${context ? `\n\nUser supplied document/file context:\n${context}` : ''}` }, ...messages];
   let lastGroqError = null;
