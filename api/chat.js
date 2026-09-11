@@ -13,6 +13,7 @@ export default async function handler(req, res) {
   const HF_FAL = `${HF_ROUTER}/fal-ai`;
   const TEXT_IMAGE_MODEL = 'Tongyi-MAI/Z-Image-Turbo';
   const QUALITY_IMAGE_MODEL = 'black-forest-labs/FLUX.1-dev';
+  const VIDEO_MODEL = 'tencent/HunyuanVideo';
   const FLUX_EDIT_PATH = 'fal-ai/flux-2/edit';
   const QWEN_EDIT_PATH = 'fal-ai/qwen-image-edit-2509';
 
@@ -52,6 +53,24 @@ export default async function handler(req, res) {
     const raw = await image.arrayBuffer();
     const mimeType = (image.type || 'image/png').split(';')[0].trim().toLowerCase();
     if (!mimeType.startsWith('image/')) throw new Error(`Hugging Face returned ${mimeType || 'non-image'} for ${model}.`);
+    return { mimeType, data: Buffer.from(raw).toString('base64') };
+  }
+
+  async function hfProviderVideo(model, prompt) {
+    const client = new InferenceClient(hfToken);
+    const video = await client.textToVideo({
+      provider: 'auto',
+      model,
+      inputs: prompt,
+      parameters: {
+        num_frames: 65,
+        num_inference_steps: 30,
+        guidance_scale: 6
+      }
+    });
+    const raw = await video.arrayBuffer();
+    const mimeType = (video.type || 'video/mp4').split(';')[0].trim().toLowerCase();
+    if (!mimeType.startsWith('video/')) throw new Error(`Hugging Face returned ${mimeType || 'non-video'} for ${model}.`);
     return { mimeType, data: Buffer.from(raw).toString('base64') };
   }
 
@@ -107,7 +126,7 @@ export default async function handler(req, res) {
   const incomingMessages = Array.isArray(body.messages) ? body.messages : [];
   const workspace = typeof body.workspace === 'string' ? body.workspace : 'Core';
   const context = typeof body.context === 'string' ? body.context.slice(0, 60000) : '';
-  const generationMode = body.generationMode === 'quality' ? 'quality' : 'fast';
+  const generationMode = ['quality', 'video'].includes(body.generationMode) ? body.generationMode : 'fast';
   if (!incomingMessages.length) return res.status(400).json({ error: 'Messages are required.' });
 
   const messages = incomingMessages.filter(m => m && typeof m === 'object' && ['user', 'assistant', 'system'].includes(m.role) && (typeof m.content === 'string' || Array.isArray(m.content))).slice(-30);
@@ -132,7 +151,46 @@ export default async function handler(req, res) {
     : String(latestUser?.content || '').trim();
 
   const imageGenerationRequest = (!hasImage && /\b(create|generate|make|draw|render|design|produce)\b[\s\S]{0,80}\b(image|picture|photo|art|illustration|wallpaper|poster|logo|portrait)\b/i.test(userText)) || (!hasImage && /\b(image|picture|photo|art|illustration|wallpaper|poster)\b[\s\S]{0,40}\b(generate|create|make|draw|render)\b/i.test(userText));
+  const videoGenerationRequest = (!hasImage && /\b(create|generate|make|draw|render|produce)\b[\s\S]{0,80}\b(video|clip|movie|animation)\b/i.test(userText)) || (!hasImage && /\b(video|clip|movie|animation)\b[\s\S]{0,40}\b(generate|create|make|draw|render)\b/i.test(userText));
   const imageToImageRequest = hasImage && /\b(edit|change|modify|transform|restyle|redesign|remove|replace|add|turn|convert|make|generate|create|draw|render)\b/i.test(userText) && /\b(image|photo|picture|it|this|that|background|person|object|style|color|clothes|face)\b/i.test(userText);
+
+  if (videoGenerationRequest || generationMode === 'video') {
+    if (!hfToken) return res.status(500).json({ error: 'NOVA video generation is not configured. Add HF_TOKEN to Vercel.' });
+
+    const prompt = [
+      'Create the requested video.',
+      'Generate the video itself, not a description of it.',
+      'Follow the user request closely with coherent motion, composition, lighting, camera movement, and temporal consistency.',
+      'Prioritize realistic motion and strong prompt fidelity.',
+      `User request: ${userText || 'Create a video.'}`,
+      context ? `Relevant context:\n${context}` : ''
+    ].filter(Boolean).join('\n\n');
+
+    try {
+      const video = await hfProviderVideo(VIDEO_MODEL, prompt);
+      return res.status(200).json({
+        message: 'Here is your generated video.',
+        video,
+        model: VIDEO_MODEL,
+        provider: 'Hugging Face Inference Providers',
+        vision: false,
+        route: 'text-to-video-hf-inference-providers',
+        generationMode: 'video',
+        paidFallback: false
+      });
+    } catch (error) {
+      const details = error?.message || 'Inference failed.';
+      return res.status(502).json({
+        error: `NOVA could not generate the video with Hugging Face. No paid fallback was used.\n\nMODEL: ${VIDEO_MODEL}\nREAL ERROR: ${details}`,
+        details,
+        provider: 'Hugging Face Inference Providers',
+        model: VIDEO_MODEL,
+        route: 'text-to-video-hf-inference-providers',
+        generationMode: 'video',
+        paidFallback: false
+      });
+    }
+  }
 
   if (imageGenerationRequest) {
     if (!hfToken) return res.status(500).json({ error: 'NOVA image generation is not configured. Add HF_TOKEN to Vercel.' });
