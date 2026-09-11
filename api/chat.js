@@ -1,3 +1,5 @@
+import { InferenceClient } from '@huggingface/inference';
+
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
@@ -9,13 +11,8 @@ export default async function handler(req, res) {
 
   const HF_ROUTER = 'https://router.huggingface.co';
   const HF_FAL = `${HF_ROUTER}/fal-ai`;
-  const HF_INFERENCE = `${HF_ROUTER}/hf-inference/models`;
   const TEXT_IMAGE_MODEL = 'Tongyi-MAI/Z-Image-Turbo';
-  const QUALITY_IMAGE_MODELS = [
-    'Qwen/Qwen-Image',
-    'inclusionAI/LLaDA-Image-Turbo',
-    'inclusionAI/LLaDA-Image'
-  ];
+  const QUALITY_IMAGE_MODEL = 'black-forest-labs/FLUX.1-dev';
   const FLUX_EDIT_PATH = 'fal-ai/flux-2/edit';
   const QWEN_EDIT_PATH = 'fal-ai/qwen-image-edit-2509';
 
@@ -40,26 +37,22 @@ export default async function handler(req, res) {
     return { mimeType, data: Buffer.from(raw).toString('base64') };
   }
 
-  async function hfInferenceImage(model, prompt) {
-    const response = await fetch(`${HF_INFERENCE}/${model}`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${hfToken}`,
-        'Content-Type': 'application/json',
-        Accept: 'image/png, image/jpeg, application/json'
-      },
-      body: JSON.stringify({ inputs: prompt })
+  async function hfProviderImage(model, prompt) {
+    const client = new InferenceClient(hfToken);
+    const image = await client.textToImage({
+      provider: 'auto',
+      model,
+      inputs: prompt,
+      parameters: {
+        num_inference_steps: 28,
+        width: 1024,
+        height: 1024
+      }
     });
-    const raw = await response.arrayBuffer();
-    if (!response.ok) throw new Error(`Hugging Face hf-inference: HTTP ${response.status} — ${await readError(response, raw)}`);
-    const contentType = (response.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
-    if (contentType.startsWith('image/')) return { mimeType: contentType, data: Buffer.from(raw).toString('base64') };
-    let data = {};
-    try { data = JSON.parse(new TextDecoder().decode(raw)); } catch { throw new Error(`Hugging Face returned ${contentType || 'non-image'} instead of an image.`); }
-    if (data?.error) throw new Error(typeof data.error === 'string' ? data.error : JSON.stringify(data.error));
-    const imageUrl = data?.images?.[0]?.url || data?.image?.url;
-    if (imageUrl) return await imageUrlToPayload(imageUrl);
-    throw new Error(`Hugging Face completed without an image: ${JSON.stringify(data).slice(0, 1200)}`);
+    const raw = await image.arrayBuffer();
+    const mimeType = (image.type || 'image/png').split(';')[0].trim().toLowerCase();
+    if (!mimeType.startsWith('image/')) throw new Error(`Hugging Face returned ${mimeType || 'non-image'} for ${model}.`);
+    return { mimeType, data: Buffer.from(raw).toString('base64') };
   }
 
   async function falQueueImage(path, body) {
@@ -156,33 +149,30 @@ export default async function handler(req, res) {
     ].filter(Boolean).join('\n\n');
 
     if (generationMode === 'quality') {
-      const failures = [];
-      for (const model of QUALITY_IMAGE_MODELS) {
-        try {
-          const image = await hfInferenceImage(model, prompt);
-          return res.status(200).json({
-            message: 'Here is your high-quality image.',
-            image,
-            model,
-            provider: 'Hugging Face / hf-inference',
-            vision: false,
-            route: 'text-to-image-quality-hf-inference',
-            generationMode: 'quality',
-            paidFallback: false
-          });
-        } catch (error) {
-          failures.push(`${model}: ${error?.message || 'Inference failed.'}`);
-        }
+      try {
+        const image = await hfProviderImage(QUALITY_IMAGE_MODEL, prompt);
+        return res.status(200).json({
+          message: 'Here is your high-quality image.',
+          image,
+          model: QUALITY_IMAGE_MODEL,
+          provider: 'Hugging Face Inference Providers',
+          vision: false,
+          route: 'text-to-image-quality-hf-inference-providers',
+          generationMode: 'quality',
+          paidFallback: false
+        });
+      } catch (error) {
+        const details = error?.message || 'Inference failed.';
+        return res.status(502).json({
+          error: `NOVA could not generate the high-quality image with Hugging Face. No paid fallback was used.\n\nMODEL: ${QUALITY_IMAGE_MODEL}\nREAL ERROR: ${details}`,
+          details,
+          provider: 'Hugging Face Inference Providers',
+          model: QUALITY_IMAGE_MODEL,
+          route: 'text-to-image-quality-hf-inference-providers',
+          generationMode: 'quality',
+          paidFallback: false
+        });
       }
-      return res.status(502).json({
-        error: `NOVA could not generate the high-quality image with the available Hugging Face models. No paid fallback was used.\n\nTRIED ${QUALITY_IMAGE_MODELS.length} FREE-FIRST HF MODELS:\n${failures.join('\n')}`,
-        details: failures.join('\n'),
-        provider: 'Hugging Face / hf-inference',
-        modelsTried: QUALITY_IMAGE_MODELS,
-        route: 'text-to-image-quality-hf-inference',
-        generationMode: 'quality',
-        paidFallback: false
-      });
     }
 
     try {
